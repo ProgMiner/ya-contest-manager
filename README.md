@@ -35,7 +35,10 @@ export REVIEW_API_KEY="your-api-key"   # только для review_contest.py
 > [!TIP]
 > Для удобства создайте файл `.env` и загружайте его через `source .env` — он уже в `.gitignore`.
 
-Токен Яндекс.Контеста выдаётся в [Яндекс.OAuth](https://oauth.yandex.ru/).
+Для работы скриптов нужен OAuth-токен с правами **Управление соревнованиями и участниками** (`contest:manage`).
+Порядок действий:
+1. [Создайте приложение](https://oauth.yandex.ru/client/new/) в Яндекс.OAuth и выберите нужные права — см. [Доступ к API Контеста](https://admin.contest.yandex.ru/docs/ru/api-access).
+2. [Получите токен вручную](https://yandex.ru/dev/id/doc/ru/tokens/debug-token) по `client_id` приложения.
 
 ### Почему нужно вставлять JavaScript в консоль
 
