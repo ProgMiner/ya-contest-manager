@@ -1,4 +1,4 @@
-# Yandex Contest Manager
+# Yandex.Contest Manager
 
 Скрипты для работы с Crash-отправлениями в [Яндекс.Контесте](https://contest.yandex.ru):
 массовое игнорирование, скачивание исходников и автоматическое ревью через LLM.
@@ -12,7 +12,7 @@
 ## Установка
 
 ```bash
-git clone <repo-url> && cd ya-contest-manager
+git clone https://github.com/ProgMiner/ya-contest-manager && cd ya-contest-manager
 python3 -m venv venv && source venv/bin/activate
 pip install aiohttp
 ```
@@ -51,31 +51,27 @@ export REVIEW_API_KEY="your-api-key"   # только для review_contest.py
 
 ```bash
 # Массовое игнорирование старых Crash (кроме последней посылки)
-python3 make_ignored.py CONTEST_ID
+./make_ignored.py CONTEST_ID
 
 # Просмотр / скачивание последних Crash-посылок
-python3 crash_viewer.py CONTEST_ID
-python3 crash_viewer.py CONTEST_ID --save --problem A --hours 3
+./crash_viewer.py CONTEST_ID
+./crash_viewer.py CONTEST_ID --save --problem A --hours 3
 
 # Скачивание всех задач в структуру tasks/<alias>/solutions/
 ./download_contest.sh CONTEST_ID
 
 # Автоматическое ревью решений через LLM
-python3 review_contest.py CONTEST_ID
+./review_contest.py CONTEST_ID
 ```
 
-Подробности опций — `python3 <script> --help`.
+Подробности опций — `./<script> --help`.
 Полная документация для разработчика — [`AGENTS.md`](AGENTS.md).
 
 ## Типичный рабочий процесс
 
 ```bash
-./download_contest.sh 1426      # 1. Скачать Crash-посылки
-vim tasks/A/statement.md        # 2. Заполнить условия задач
-python3 review_contest.py 1426  # 3. Запустить ревью
-                                # 4. Вставить JS в консоль админ-панели
+./download_contest.sh 1426  # 1. Скачать Crash-посылки
+vim tasks/A/statement.md    # 2. Заполнить условия задач
+./review_contest.py 1426    # 3. Запустить ревью
+                            # 4. Вставить JS в консоль админ-панели
 ```
-
-## Лицензия
-
-[MIT](LICENSE) &copy; Eridan Domoratskiy
