@@ -1,6 +1,7 @@
 # Yandex Contest Manager
 
-Скрипты для работы с Crash-отправлениями в [Яндекс.Контесте](https://contest.yandex.ru): массовое игнорирование, скачивание исходников и автоматическое ревью через LLM.
+Скрипты для работы с Crash-отправлениями в [Яндекс.Контесте](https://contest.yandex.ru):
+массовое игнорирование, скачивание исходников и автоматическое ревью через LLM.
 
 ## Требования
 
@@ -38,7 +39,8 @@ export REVIEW_API_KEY="your-api-key"   # только для review_contest.py
 
 ### Почему нужно вставлять JavaScript в консоль
 
-Публичный API **не позволяет** менять вердикт посылки — только через админ-панель в браузере. Поэтому скрипты генерируют JavaScript для вставки в DevTools-консоль.
+Публичный API **не позволяет** менять вердикт посылки — только через админ-панель в браузере.
+Поэтому скрипты генерируют JavaScript для вставки в DevTools-консоль.
 
 ---
 
@@ -59,15 +61,16 @@ python3 crash_viewer.py CONTEST_ID --save --problem A --hours 3
 python3 review_contest.py CONTEST_ID
 ```
 
-Подробности опций — `python3 <script> --help`. Полная документация для разработчика — [`AGENTS.md`](AGENTS.md).
+Подробности опций — `python3 <script> --help`.
+Полная документация для разработчика — [`AGENTS.md`](AGENTS.md).
 
 ## Типичный рабочий процесс
 
 ```bash
-./download_contest.sh 1426        # 1. Скачать Crash-посылки
-vim tasks/A/statement.md           # 2. Заполнить условия задач
-python3 review_contest.py 1426    # 3. Запустить ревью
-                                   # 4. Вставить JS в консоль админ-панели
+./download_contest.sh 1426      # 1. Скачать Crash-посылки
+vim tasks/A/statement.md        # 2. Заполнить условия задач
+python3 review_contest.py 1426  # 3. Запустить ревью
+                                # 4. Вставить JS в консоль админ-панели
 ```
 
 ## Лицензия

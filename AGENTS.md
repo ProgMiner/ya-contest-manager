@@ -93,15 +93,13 @@ Env var: `TASKS_DIR` (default `./tasks`) — used by the shell script only, **no
 
 Does **not** make requests to the Yandex Contest API. Works with local files and sends requests to an OpenAI-compatible API.
 
-**Data flow:** `discover_units()` → `review_all()` (concurrent via `asyncio.gather`) → `interactive_review()` → `emit_admin_js_split()` + `emit_manual_urls()` → `write_report()` → `cleanup(ok+wa)` + `park_manual(manual)`.
+**Data flow:** `discover_units()` → `review_all()` (concurrent via `asyncio.gather`) → `interactive_review()` → `emit_admin_js_split()` + `emit_manual_urls()` → `cleanup(ok+wa+manual)`.
 
 **Model verdict:** JSON `{"percent": 0-100, "summary": "...", "remarks": [...]}`. Parsing via `parse_verdicts` with fallback strategies and `validate_payload` (type coercion).
 
 **Threshold logic:** `CONF_THRESHOLD = 15.0`. `percent ≤ CONF_THRESHOLD` → WA recommendation (requires operator confirmation); `percent ≥ (100 - CONF_THRESHOLD)` → auto-OK (no operator prompt); in between → "N/A" (manual review). The relationship `100 - CONF_THRESHOLD` is the design intent and is not obvious from either literal alone — if you change the constant, re-derive the boundary.
 
 **Key constants (values in code, names only here):** `REQUEST_TIMEOUT`, `MAX_ATTEMPTS`, `API_CONCURRENCY`, `API_MAX_RETRIES`, `API_RETRY_DELAY`, `RETRY_BACKOFF`, `RETRY_AFTER_CAP`, `CANCEL_REASON`.
-
-**Report:** JSON file `review_report.json` (default, `REPORT_FILE_DEFAULT`) written **before** file mutation; contains all verdicts (ok/wa/manual/skipped) and errors.
 
 **MODEL_OPTIONS:** dict with model request parameters (temperature, reasoning_effort, prompt_cache_key) — values in code (`review_contest.py`, constant `MODEL_OPTIONS`).
 
@@ -113,7 +111,7 @@ Does **not** make requests to the Yandex Contest API. Works with local files and
 
 **`discover_units` skip predicate:** a task is skipped if: `statement.md` is empty or missing; `solutions/` directory does not exist; filename is not numeric; dot-files (e.g. `.DS_Store`); subdirectories inside `solutions/`. This affects user-visible behavior — if you change the predicate, update Troubleshooting in README.
 
-**File lifecycle after review:** OK/WA solution files are **deleted**; solutions deferred to manual review are **moved** to `tasks/<alias>/manual/`. `--keep-files` disables both. The report is written **before** any file mutation, so even if the script crashes mid-cleanup, the verdicts are preserved.
+**File lifecycle after review:** all decided solutions (OK, WA, and manual-review) are **deleted**; only skipped files remain on disk. `--keep-files` disables deletion.
 
 ---
 
@@ -140,19 +138,17 @@ E2E test requires port 18999 to be free.
 
 4. **`emit_admin_js_split` never trusts model output for `submission_id`** — the model might hallucinate IDs. Only the filename (which was set by `download_contest.sh` from the real API) is used.
 
-5. **Report written before file mutation** — ensures crash-safety. The verdicts survive even if cleanup is interrupted.
+5. **`TimeoutError` not retried in `call_model`** — retry ownership belongs to `review_unit`, which controls the attempt budget. This prevents double-counting retries.
 
-6. **`TimeoutError` not retried in `call_model`** — retry ownership belongs to `review_unit`, which controls the attempt budget. This prevents double-counting retries.
+6. **Ctrl+C two-stage handling** — first press is graceful (cancels tasks, collects `Failure(CANCEL_REASON)` results); second press force-exits. The handler is removed after `review_all` completes so `interactive_review` gets standard `KeyboardInterrupt`.
 
-7. **Ctrl+C two-stage handling** — first press is graceful (cancels tasks, collects `Failure(CANCEL_REASON)` results); second press force-exits. The handler is removed after `review_all` completes so `interactive_review` gets standard `KeyboardInterrupt`.
+7. **1-based pagination** — `page=0` causes HTTP 500. This is a Yandex Contest API quirk; the code always starts from page 1.
 
-8. **1-based pagination** — `page=0` causes HTTP 500. This is a Yandex Contest API quirk; the code always starts from page 1.
+8. **`/source` endpoint returns raw bytes** — not JSON. Using `api.request()` will fail; must use `api.session.request()` with `headers={"Accept": "*/*"}` and `response.read()`. Empty body (`b""`) is valid (submission exists but has no source).
 
-9. **`/source` endpoint returns raw bytes** — not JSON. Using `api.request()` will fail; must use `api.session.request()` with `headers={"Accept": "*/*"}` and `response.read()`. Empty body (`b""`) is valid (submission exists but has no source).
+9. **`TASKS_DIR` env var vs `--tasks-dir` flag** — the env var is read only by `download_contest.sh` (shell); `review_contest.py` reads `--tasks-dir` flag (Python). They default to the same value but are configured differently.
 
-10. **`TASKS_DIR` env var vs `--tasks-dir` flag** — the env var is read only by `download_contest.sh` (shell); `review_contest.py` reads `--tasks-dir` flag (Python). They default to the same value but are configured differently.
-
-11. **File lifecycle: delete OK/WA, park manual** — destructive by default. `--keep-files` is the escape hatch. This design prevents re-reviewing already-processed solutions.
+10. **File lifecycle: delete OK/WA/manual** — destructive by default. Manual-review solutions are deleted too (operator uses admin-panel URLs to view them). `--keep-files` is the escape hatch. This design prevents re-reviewing already-processed solutions.
 
 ---
 

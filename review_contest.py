@@ -81,8 +81,6 @@ API_MAX_RETRIES = 3         # повторов на 429/5xx внутри call_mo
 API_RETRY_DELAY = 1.0       # начальная задержка backoff, с (1с → 2с → 4с)
 RETRY_AFTER_CAP = 60.0      # максимальная задержка Retry-After, с
 CANCEL_REASON = "отменено пользователем (Ctrl+C)"
-MANUAL_DIR_NAME = "manual"
-REPORT_FILE_DEFAULT = "review_report.json"
 
 
 # ----------------------------------------------------------------------
@@ -975,91 +973,30 @@ def emit_manual_urls(manual: list[Verdict]) -> None:
         )
 
 
-def park_manual(manual: list[Verdict]) -> None:
-    """Отложенные на ручную проверку решения переносятся из solutions/
-    в ../manual/: файлы сохраняются, но не попадают в discover_units."""
-    for verdict in manual:
-        src = verdict.unit.solution_path
-        target_dir = verdict.unit.statement_path.parent / MANUAL_DIR_NAME
-        try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            dst = target_dir / src.name
-            src.replace(dst)
-        except OSError as exc:
-            print(
-                f"  Не удалось перенести {src}: {exc} — файл оставлен на месте",
-                file=sys.stderr,
-            )
-            continue
-        print(f"  Отложено: {dst} (посылка {verdict.unit.submission_id})")
 
-
-def build_report(
-    contest_id: int, model: str, base_url: str,
-    ok: list[Verdict], wa: list[Verdict],
-    manual: list[Verdict], skipped: list[Verdict],
-    failures: list[Failure],
-) -> dict:
-    """Собрать JSON-отчёт о результатах ревью."""
-    def entry(v: Verdict, decision: str) -> dict:
-        return {
-            "alias": v.unit.alias,
-            "submission_id": v.unit.submission_id,
-            "percent": v.percent,
-            "summary": v.summary,
-            "remarks": v.remarks,
-            "attempts": v.attempts,
-            "recommendation": decide_verdict(v.percent),
-            "decision": decision,
-            "url": ADMIN_SUBMISSION_URL.format(submission_id=v.unit.submission_id),
-            "path": str(v.unit.solution_path),
-        }
-    return {
-        "contest_id": contest_id,
-        "model": model,
-        "base_url": base_url,
-        "verdicts": (
-            [entry(v, VERDICT_OK) for v in ok]
-            + [entry(v, VERDICT_WA) for v in wa]
-            + [entry(v, "manual") for v in manual]
-            + [entry(v, "skipped") for v in skipped]
-        ),
-        "failures": [
-            {
-                "alias": f.alias,
-                "submission_id": f.submission_id,
-                "path": str(f.path) if f.path else None,
-                "reason": f.reason,
-            }
-            for f in failures
-        ],
-    }
-
-
-def write_report(path: Path, report: dict) -> None:
-    """Атомарная запись: tmp + replace."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    tmp.replace(path)
 
 
 def cleanup(
     decided: list[Verdict],
     failures: list[Failure],
+    manual: list[Verdict] | None = None,
 ) -> None:
     """
     Удалить файлы решений, для которых принято решение.
 
-    Неразобранные (failures) и пропущенные файлы не трогаются.
+    Неразобранные (failures) и пропущенные (quit) файлы не трогаются.
+    Решения на ручную проверку (manual) также удаляются — оператор
+    посмотрит их в интерфейсе Яндекс.Контест по выданным ссылкам.
     """
 
     # failures учитывается в итоговом отчёте, здесь не нужен
     del failures
 
-    for verdict in decided:
+    to_delete = decided
+    if manual:
+        to_delete = decided + manual
+
+    for verdict in to_delete:
         path = verdict.unit.solution_path
         path.unlink(missing_ok=True)
         print(
@@ -1187,22 +1124,6 @@ async def main() -> None:
         action="store_true",
         default=False,
         help="Не удалять файлы решений после ревью",
-    )
-
-    parser.add_argument(
-        "--report",
-        default=REPORT_FILE_DEFAULT,
-        help=(
-            "Путь к файлу отчёта JSON "
-            f"(по умолчанию {REPORT_FILE_DEFAULT})"
-        ),
-    )
-
-    parser.add_argument(
-        "--no-report",
-        action="store_true",
-        default=False,
-        help="Не записывать файл отчёта",
     )
 
     args = parser.parse_args()
@@ -1345,33 +1266,14 @@ async def main() -> None:
         print("\nПосылки на ручную проверку:")
         emit_manual_urls(manual)
 
-    # Записываем отчёт до мутации файлов
-    if not args.no_report:
-        report_path = Path(args.report)
-        try:
-            report = build_report(
-                args.contest_id, args.model, args.base_url,
-                ok_verdicts, wa_verdicts, manual, skipped, failures,
-            )
-            write_report(report_path, report)
-            print(f"\nОтчёт записан: {report_path}")
-        except OSError as exc:
-            print(
-                f"Не удалось записать отчёт {report_path}: {exc}",
-                file=sys.stderr,
-            )
-
     applied = ok_verdicts + wa_verdicts
 
-    # Удаляем обработанные решения (OK/WA — вердикт применён)
+    # Удаляем обработанные решения (OK/WA + ручная проверка)
     if not args.keep_files:
-        if applied:
+        if applied or manual:
             print("\nОчистка обработанных решений:")
-            cleanup(applied, failures)
-        if manual:
-            print("\nПереношу решения на ручную проверку:")
-            park_manual(manual)
-        if not applied and not manual:
+            cleanup(applied, failures, manual=manual)
+        else:
             print("\nРешений для очистки нет.")
 
     # Итог
