@@ -29,7 +29,6 @@ from typing import Any
 
 from api import (
     YandexContestAPI,
-    BASE_URL,
     TOKEN,
     CONCURRENCY,
     CRASH_VERDICT,
@@ -184,7 +183,6 @@ def format_problem_header(submission: dict[str, Any]) -> str:
 async def process_contest(
     contest_id: int,
     concurrency: int = CONCURRENCY,
-    base_url: str | None = None,
     hours: float = 2.5,
     problem_filter: list[str] | None = None,
     save: bool = False,
@@ -192,7 +190,6 @@ async def process_contest(
 ):
     async with YandexContestAPI(
         TOKEN,
-        base_url=base_url or BASE_URL,
         concurrency=concurrency,
     ) as api:
 

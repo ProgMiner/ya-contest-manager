@@ -18,12 +18,8 @@ from typing import Any
 import aiohttp
 
 
-# Базовый URL публичного API Яндекс.Контеста.
-# Можно переопределить через окружение YANDEX_CONTEST_BASE_URL.
-BASE_URL = os.environ.get(
-    "YANDEX_CONTEST_BASE_URL",
-    "https://api.contest.yandex.net/api/public/v2",
-)
+# Базовый URL публичного API Яндекс.Контеста v2.
+BASE_URL = "https://api.contest.yandex.net/api/public/v2"
 
 # Можно передать через окружение:
 # export YANDEX_CONTEST_TOKEN="..."
@@ -42,7 +38,6 @@ class YandexContestAPI:
     def __init__(
         self,
         token: str,
-        base_url: str = BASE_URL,
         concurrency: int = 10,
     ):
         self.token = token
@@ -50,7 +45,7 @@ class YandexContestAPI:
         # не склеивается:
         #   base_url "https://host/api/v2" + "/contests/..." ->
         #   "https://host/contests/..."  (потерянный префикс!)
-        self.base_url = base_url.rstrip("/") + "/"
+        self.base_url = BASE_URL.rstrip("/") + "/"
         self.semaphore = asyncio.Semaphore(concurrency)
 
         self.session: aiohttp.ClientSession | None = None

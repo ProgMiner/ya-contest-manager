@@ -90,7 +90,7 @@ asyncio.run(main())
     stdin = "+\n+\n"
 
     cmd = [
-        sys.executable, str(BASE / "review_contest.py"), "95164",
+        sys.executable, str(BASE / "review_contest.py"), "1426",
         "--tasks-dir", str(FIXTURE),
         "--base-url", f"http://127.0.0.1:{PORT}/v1/",
         "--concurrency", "2",

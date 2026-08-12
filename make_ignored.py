@@ -19,7 +19,6 @@ from typing import Any
 
 from api import (
     YandexContestAPI,
-    BASE_URL,
     TOKEN,
     CONCURRENCY,
     CRASH_VERDICT,
@@ -40,12 +39,10 @@ IGNORED_VERDICT = "Ignored"
 async def process_contest(
     contest_id: int,
     concurrency: int = CONCURRENCY,
-    base_url: str | None = None,
     delay_ms: int = 500,
 ):
     async with YandexContestAPI(
         TOKEN,
-        base_url=base_url or BASE_URL,
         concurrency=concurrency,
     ) as api:
 

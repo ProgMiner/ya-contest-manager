@@ -1,63 +1,57 @@
 # Yandex Contest Manager — AGENTS.md
 
-## Project Overview
+Instructions for developers and AI agents modifying this codebase.
 
-Скрипты для работы с Crash-отправлениями в Яндекс.Контесте.
+**README.md** contains minimal user-facing docs: what the project does, requirements, env vars, one-line launch examples. Detailed options and exit codes are available via `--help` and in the source code — do not duplicate them here.
 
-### make_ignored.py — массовое игнорирование старых Crash
-- Получает все отправления контеста через публичный API v2
-- Фильтрует только Crash
-- Группирует по (пользователь, задача)
-- Помечает все Crash как Ignored, **кроме** самого последнего по времени
-- Генерирует JavaScript для вставки в консоль админ-панели (т.к. публичный API не позволяет менять вердикт)
+> **Maintenance rules:**
+> - When you discover a new design decision, quirk, or invariant not documented here, you MUST add it to this file. Stale or missing AGENTS.md causes avoidable bugs.
+> - Keep this file **minimal**. Only document what the source code cannot easily reveal: non-obvious design intent, cross-module contracts, API gotchas, security invariants, and behavioral quirks. Do not clutter the agent's context with facts it can read directly from the code (CLI flags, defaults, obvious data structures, etc.).
 
-### crash_viewer.py — просмотр и скачивание последних Crash с исходным кодом
-- Обратный фильтр: для каждого (пользователь, задача) оставляет **только** самую последнюю Crash-посылку
-- Исключает пользователей, у которых есть ЛЮБАЯ посылка за последние N часов (по умолчанию 2.5) — они ещё участвуют
-- Скачивает исходный код посылок через `/contests/{contestId}/submissions/{submissionId}/source`
-- Бинарные/файловые посылки пропускаются
-- `--save` — сохраняет файлы как `<submission_id>` в текущий каталог (без расширения); имя файла = runId в админ-панели
-- `--dry-run` — показать список посылок без загрузки исходников
+---
 
-### download_contest.sh — обёртка для скачивания всех задач
-- Создаёт структуру каталогов `tasks/<alias>/solutions/` + пустой `statement.md`
-- Для каждой задачи вызывает `crash_viewer.py --save --problem <alias>` в её каталоге `solutions/`
-- Если `--problem` не указан — автоматически определяет список задач через dry-run
+## Project Files
 
-### review_contest.py — автоматическое ревью через OpenAI-совместимое API
-- Для каждого решения в `tasks/<alias>/solutions/` отправляет запрос к OpenAI-совместимому API: системный промпт из `review_prompt.md`, условие и исходник — в user-сообщении
-- Разбирает JSON-ответ модели (`percent`, `summary`, `remarks`); до 3 попыток при неразборчивом ответе
-- Решения с `percent ≥ 85` автоматически помечаются OK (без запроса оператору), `percent ≤ 15` (WA) и промежуточные показываются для интерактивного подтверждения
-- Интерактивный интерфейс: `+` → OK, `-` → WA, Enter → пропустить (ручная проверка), `q` → выход
-- Генерирует JS для админ-панели и URL-адреса для ручной проверки
-- Удаляет файлы решений, для которых вердикт применён (OK/WA); отложенные на ручную проверку переносятся в `tasks/<alias>/manual/`; `--keep-files` отключает удаление и перенос
-- Требует переменную окружения `REVIEW_API_KEY`
+| File | Purpose | Entry point |
+|---|---|---|
+| `api.py` | Shared module: `YandexContestAPI`, retry, pagination, helpers | — (imported) |
+| `make_ignored.py` | Bulk-ignore old Crash submissions | `async def main()` |
+| `crash_viewer.py` | View / download Crash submissions | `async def main()` |
+| `download_contest.sh` | Wrapper over `crash_viewer.py` | direct execution |
+| `review_contest.py` | LLM-based contest review | `async def main()` |
+| `review_prompt.md` | System prompt for the model | — (read by `review_contest.py`) |
+| `test_review_contest_async.py` | Unit tests for async logic of `review_contest.py` | `python3 -m unittest test_review_contest_async -v` |
+| `test_e2e_review.py` | E2E test: CLI vs mock server (port 18999) | `python3 test_e2e_review.py` |
+
+---
 
 ## Yandex Contest API v2 (Public)
 
 ### Authentication
-OAuth token в заголовке `Authorization: OAuth {token}`. Переменная окружения: `YANDEX_CONTEST_TOKEN`.
+OAuth token in `Authorization: OAuth {token}` header. Env var: `YANDEX_CONTEST_TOKEN`.
 
 ### Pagination
-**Нумерация страниц 1-базированная!** `page=0` вызывает HTTP 500.
+**Pages are 1-based!** `page=0` triggers HTTP 500.
 
 ### Key Endpoints
 
-- `GET /contests/{contestId}` — информация о контесте (не критична при ошибке)
-- `GET /contests/{contestId}/submissions?page=1&pageSize=100` — посылки с пагинацией. Response: `{"count": N, "submissions": [...]}`
-- `GET /contests/{contestId}/submissions/{submissionId}/source` — исходный код, возвращает `application/octet-stream` (сырые байты, НЕ JSON). Нельзя использовать `api.request()` — нужен прямой запрос через `api.session.request()` с `headers={"Accept": "*/*"}` и ручным `response.read()`. Пустой ответ (`b""`) — валиден. Бинарные посылки определяются по нулевым байтам или ошибке UTF-8.
-- `POST /submissions/{submissionId}/rejudge` — перезапуск проверки
+- `GET /contests/{contestId}` — contest info (non-critical on error)
+- `GET /contests/{contestId}/submissions?page=1&pageSize=100` — submissions with pagination. Response: `{"count": N, "submissions": [...]}`
+- `GET /contests/{contestId}/submissions/{submissionId}/source` — source code, returns `application/octet-stream` (raw bytes, NOT JSON). **Do not use `api.request()`** — use `api.session.request()` with `headers={"Accept": "*/*"}` and manual `response.read()`. Empty body (`b""`) is valid. Binary submissions detected by null bytes or UTF-8 decode failure.
+- `POST /submissions/{submissionId}/rejudge` — rejudge
 
 ### Important Notes
-- `problemId` — строка, не число
-- Вердикт — строка, сравнивать case-insensitive
-- При равенстве `submissionTime` — все такие посылки считаются «последними», выводится предупреждение
-- HTTP 5xx ретраятся с экспоненциальной задержкой (3 повторных попытки, 1с → 2с → 4с; всего до 4 запросов)
-- **Изменить вердикт через публичный API нельзя** — только через админ-панель
+- `problemId` is a **string**, not a number
+- Verdict is a string — compare **case-insensitive**
+- When `submissionTime` values tie, all such submissions are treated as "latest"; a warning is printed
+- HTTP 5xx retried with exponential backoff (3 retries, 1s → 2s → 4s; up to 4 total requests)
+- **Verdict cannot be changed via the public API** — only via the admin panel (see Admin API below)
+
+---
 
 ## Admin API (Yandex Contest Admin Panel)
 
-Смена вердикта возможна только через внутренний API админ-панели. Скрипт не может вызывать его напрямую (нужен CSRF-токен сессии браузера), поэтому генерирует JavaScript для вставки в DevTools-консоль.
+Verdict changes require the internal admin-panel API. The scripts cannot call it directly (needs a browser-session CSRF token), so they generate JavaScript for the user to paste into DevTools console.
 
 ```
 PATCH /api/admin/contest/{contestId}/submission/verdict
@@ -65,70 +59,108 @@ PATCH /api/admin/contest/{contestId}/submission/verdict
      &filter=runId%3D{submissionId}
 ```
 
-CSRF-токен извлекается из `<meta name="secretkey">` или cookie, заголовок: `x-csrf-token`. `submissionId` из публичного API = `runId` в фильтре админ-панели.
+CSRF token extracted from `<meta name="secretkey">` or cookie, header: `x-csrf-token`. `submissionId` from the public API = `runId` in the admin filter.
 
-## Running
-
-```bash
-# make_ignored.py — сгенерировать JS для админ-панели:
-python make_ignored.py CONTEST_ID
-python make_ignored.py CONTEST_ID --delay 1000 --concurrency 5
-
-# crash_viewer.py — просмотр/скачивание Crash-посылок:
-python crash_viewer.py CONTEST_ID
-python crash_viewer.py CONTEST_ID --problem A --problem B
-python crash_viewer.py CONTEST_ID --save
-python crash_viewer.py CONTEST_ID --dry-run --hours 3
-
-# download_contest.sh — скачивание всех задач:
-./download_contest.sh CONTEST_ID
-./download_contest.sh CONTEST_ID --problem A --problem B
-
-# review_contest.py — ревью через OpenAI-совместимое API:
-export REVIEW_API_KEY="..."
-python review_contest.py CONTEST_ID
-python review_contest.py CONTEST_ID --model MODEL --base-url URL
-python review_contest.py CONTEST_ID --problem A --dry-run --keep-files
-python review_contest.py CONTEST_ID --no-report
-```
-
-Требования: Python 3.12+, aiohttp.
+---
 
 ## Code Architecture
 
-### api.py — общий модуль для работы с API Яндекс.Контеста
-Содержит `YandexContestAPI` (auth, request с retry, pagination), константы (`BASE_URL`, `TOKEN`, `CONCURRENCY`, `CRASH_VERDICT`), хелперы для извлечения полей из JSON посылки, `parse_iso_time`, `sort_key`.
+### `api.py` — shared module for Yandex Contest API
 
-### make_ignored.py — массовое игнорирование Crash
-Импортирует из `api.py`.
+Contains `YandexContestAPI` (auth, request with retry, pagination), constants (`BASE_URL`, `TOKEN`, `CONCURRENCY`, `CRASH_VERDICT`), helpers for extracting fields from JSON submission objects, `parse_iso_time`, `sort_key`. `BASE_URL` is a hardcoded constant — not configurable via env vars or CLI flags.
 
-### crash_viewer.py — просмотр и скачивание Crash
-Импортирует из `api.py`.
+**Quirk — trailing slash required:** `base_url` must end with `/` — aiohttp silently drops the path prefix otherwise (see `api.py:49-53`). The `base_url.rstrip("/") + "/"` normalization is intentional; do not remove it.
 
-Фильтр `--problem`: числовой ID → `problemId`, буквенный alias → `problemAlias`. Можно смешивать.
+### `make_ignored.py` — bulk ignore Crash
 
-### download_contest.sh — обёртка
-Shell-скрипт: dry-run → парсинг списка задач → `mkdir -p` + `crash_viewer.py --save --problem`.
+Imports from `api.py`. For each (user, problem) pair, marks all Crash submissions as Ignored **except** the latest by `submissionTime`. Generates JavaScript for the admin console.
 
-### review_contest.py — оркестратор ревью
-Не делает запросов к API Яндекс.Контеста. Работает с локальными файлами и отправляет запросы к OpenAI-совместимому API.
+### `crash_viewer.py` — view / download Crash
 
-**Поток данных:** `discover_units()` → `review_all()` (конкурентно через `asyncio.gather`) → `interactive_review()` → `emit_admin_js_split()` + `emit_manual_urls()` → `write_report()` → `cleanup(ok+wa)` + `park_manual(manual)`.
+Imports from `api.py`. Inverse filter of `make_ignored.py`: for each (user, problem), keeps **only** the latest Crash submission. Users with any submission in the last N hours are excluded (still active).
 
-**Вердикт модели:** JSON `{"percent": 0-100, "summary": "...", "remarks": [...]}`. Разбор через `parse_verdicts` с fallback-стратегиями и `validate_payload` (coercion типов).
+**`--problem` semantics:** numeric ID → matches by `problemId`; alphabetic alias → matches by `problemAlias`. You can mix them.
 
-**Пороговые значения:** `CONF_THRESHOLD = 15.0` — `percent ≤ 15` → рекомендация WA (требует подтверждения оператором), `percent ≥ (100 - 15) = 85` → автоматически OK (без запроса оператору), промежуток → "N/A" (ручная проверка).
+### `download_contest.sh` — wrapper
 
-**Ключевые константы:** `REQUEST_TIMEOUT`, `MAX_ATTEMPTS`, `API_CONCURRENCY`, `API_MAX_RETRIES`, `API_RETRY_DELAY`, `RETRY_BACKOFF`, `RETRY_AFTER_CAP`, `CANCEL_REASON` — значения в коде.
+Shell script: dry-run → parse lines `Задача <alias> (problemId=…)` via regex → `mkdir -p` → `cd solutions/ && crash_viewer.py --save --problem`.
 
-**Отчёт:** JSON-файл `review_report.json` (по умолчанию) записывается до мутации файлов; содержит все вердикты (ok/wa/manual/skipped) и ошибки. `--report PATH` — путь, `--no-report` — не писать.
+**Quirk — stdout format contract:** `crash_viewer.py`'s dry-run output format (`Задача <alias> (problemId=…): N посылок`) is parsed by regex in this shell script. If you change the header format in `crash_viewer.py`, you **will** break the shell parser. Any header change requires updating the regex in `download_contest.sh`.
 
-**MODEL_OPTIONS:** `{"temperature": 0, "reasoning_effort": "low", "prompt_cache_key": "ya-review"}`.
+Env var: `TASKS_DIR` (default `./tasks`) — used by the shell script only, **not** by `review_contest.py` (which uses `--tasks-dir` flag).
 
-**Ctrl+C:** Первый → отмена in-flight запросов через `task.cancel()` + `cancel.set()`, ожидающие задачи → `Failure(CANCEL_REASON)`. Второй → `os._exit(130)`. После `review_all` обработчик SIGINT убирается, восстанавливается стандартный `KeyboardInterrupt` для `interactive_review`.
+### `review_contest.py` — review orchestrator
 
-**Таймаут:** `TimeoutError` не ретраится внутри `call_model` — повтор на уровне `review_unit`, которая владеет бюджетом попыток. Лог таймаута содержит alias, номер попытки, timeout, endpoint и модель.
+Does **not** make requests to the Yandex Contest API. Works with local files and sends requests to an OpenAI-compatible API.
 
-**`emit_admin_js_split`:** `submission_id` берётся **только** из `unit` (имя файла), никогда из ответа модели.
+**Data flow:** `discover_units()` → `review_all()` (concurrent via `asyncio.gather`) → `interactive_review()` → `emit_admin_js_split()` + `emit_manual_urls()` → `write_report()` → `cleanup(ok+wa)` + `park_manual(manual)`.
 
-**Код возврата:** 0 — успех, 1 — ошибка/нет решений, 2 — прерван интерактивный режим (есть пропущенные).
+**Model verdict:** JSON `{"percent": 0-100, "summary": "...", "remarks": [...]}`. Parsing via `parse_verdicts` with fallback strategies and `validate_payload` (type coercion).
+
+**Threshold logic:** `CONF_THRESHOLD = 15.0`. `percent ≤ CONF_THRESHOLD` → WA recommendation (requires operator confirmation); `percent ≥ (100 - CONF_THRESHOLD)` → auto-OK (no operator prompt); in between → "N/A" (manual review). The relationship `100 - CONF_THRESHOLD` is the design intent and is not obvious from either literal alone — if you change the constant, re-derive the boundary.
+
+**Key constants (values in code, names only here):** `REQUEST_TIMEOUT`, `MAX_ATTEMPTS`, `API_CONCURRENCY`, `API_MAX_RETRIES`, `API_RETRY_DELAY`, `RETRY_BACKOFF`, `RETRY_AFTER_CAP`, `CANCEL_REASON`.
+
+**Report:** JSON file `review_report.json` (default, `REPORT_FILE_DEFAULT`) written **before** file mutation; contains all verdicts (ok/wa/manual/skipped) and errors.
+
+**MODEL_OPTIONS:** dict with model request parameters (temperature, reasoning_effort, prompt_cache_key) — values in code (`review_contest.py`, constant `MODEL_OPTIONS`).
+
+**Ctrl+C:** First → cancels in-flight requests via `task.cancel()` + `cancel.set()`, pending tasks → `Failure(CANCEL_REASON)`. Second → `os._exit(130)`. After `review_all`, the SIGINT handler is removed; standard `KeyboardInterrupt` is restored for `interactive_review`.
+
+**Timeout:** `TimeoutError` is **not** retried inside `call_model` — retry happens at the `review_unit` level, which owns the attempt budget. Timeout log includes alias, attempt number, timeout value, endpoint, and model name.
+
+**`emit_admin_js_split`:** `submission_id` is taken **only** from `unit` (filename), **never** from the model response. This is a security invariant — the model must not control which submission gets a verdict applied.
+
+**`discover_units` skip predicate:** a task is skipped if: `statement.md` is empty or missing; `solutions/` directory does not exist; filename is not numeric; dot-files (e.g. `.DS_Store`); subdirectories inside `solutions/`. This affects user-visible behavior — if you change the predicate, update Troubleshooting in README.
+
+**File lifecycle after review:** OK/WA solution files are **deleted**; solutions deferred to manual review are **moved** to `tasks/<alias>/manual/`. `--keep-files` disables both. The report is written **before** any file mutation, so even if the script crashes mid-cleanup, the verdicts are preserved.
+
+---
+
+## Tests
+
+Two test suites; run **both** before submitting changes.
+
+| Suite | Command | What it covers |
+|---|---|---|
+| `test_review_contest_async.py` | `python3 -m unittest test_review_contest_async -v` | `_parse_retry_after`, `call_model` (429/5xx retry, backoff, Retry-After, timeout), `review_unit` (verdict parse, retry on garbage, Failure), `review_all` (gather, exception containment), coroutine signatures, concurrency clamp |
+| `test_e2e_review.py` | `python3 test_e2e_review.py` | Full CLI against mock server (port 18999): retry-on-429, concurrency, interactive review, JS generation, file cleanup. Creates artifacts in `.test_tmp/`, server script `.test_e2e_server.py`, log `.test_e2e_log.json` |
+
+E2E test requires port 18999 to be free.
+
+---
+
+## Design Decisions and Quirks
+
+1. **`base_url` trailing slash** — aiohttp silently drops the path prefix if `base_url` lacks a trailing `/`. The normalization in `api.py` (`base_url.rstrip("/") + "/"`) is load-bearing; do not remove.
+
+2. **`download_contest.sh` parses `crash_viewer.py` stdout** — the dry-run header format `Задача <alias> (problemId=…): N посылок` is a contract between the two scripts. Changing the header in `crash_viewer.py` breaks the shell regex. Always update both.
+
+3. **`--problem` semantics differ across scripts** — `crash_viewer.py` accepts both numeric IDs and alphabetic aliases; `review_contest.py` matches by directory name only. This is intentional: `review_contest.py` operates on local files, not the API.
+
+4. **`emit_admin_js_split` never trusts model output for `submission_id`** — the model might hallucinate IDs. Only the filename (which was set by `download_contest.sh` from the real API) is used.
+
+5. **Report written before file mutation** — ensures crash-safety. The verdicts survive even if cleanup is interrupted.
+
+6. **`TimeoutError` not retried in `call_model`** — retry ownership belongs to `review_unit`, which controls the attempt budget. This prevents double-counting retries.
+
+7. **Ctrl+C two-stage handling** — first press is graceful (cancels tasks, collects `Failure(CANCEL_REASON)` results); second press force-exits. The handler is removed after `review_all` completes so `interactive_review` gets standard `KeyboardInterrupt`.
+
+8. **1-based pagination** — `page=0` causes HTTP 500. This is a Yandex Contest API quirk; the code always starts from page 1.
+
+9. **`/source` endpoint returns raw bytes** — not JSON. Using `api.request()` will fail; must use `api.session.request()` with `headers={"Accept": "*/*"}` and `response.read()`. Empty body (`b""`) is valid (submission exists but has no source).
+
+10. **`TASKS_DIR` env var vs `--tasks-dir` flag** — the env var is read only by `download_contest.sh` (shell); `review_contest.py` reads `--tasks-dir` flag (Python). They default to the same value but are configured differently.
+
+11. **File lifecycle: delete OK/WA, park manual** — destructive by default. `--keep-files` is the escape hatch. This design prevents re-reviewing already-processed solutions.
+
+---
+
+## Doc Conventions
+
+- **README.md** — minimal user-facing docs: what the project does, requirements, env vars, one-line launch examples. Detailed options are available via `--help`.
+- **AGENTS.md** (this file) — non-obvious design intent, cross-module contracts, API gotchas, security invariants, behavioral quirks, and test instructions. Everything else the agent can read from the code.
+- **No duplication.** A fact lives in one file. Cross-references are allowed.
+- **Constants by name, not value** — reference constant names; values live only in code.
+- **When adding new information, update this file.** When discovering a new quirk or design decision, add it to the "Design Decisions and Quirks" section.
+- **Keep minimal.** An oversized AGENTS.md wastes the agent's context window. If in doubt whether something belongs here, ask: "Would an agent modifying this code need to know this to avoid introducing a bug?" If not, leave it out.

@@ -6,10 +6,10 @@
 #   ./download_contest.sh CONTEST_ID [OPTIONS...]
 #
 # Примеры:
-#   ./download_contest.sh 95164
-#   ./download_contest.sh 95164 --problem A --problem B
-#   ./download_contest.sh 95164 --hours 3
-#   ./download_contest.sh 95164 --dry-run
+#   ./download_contest.sh 1426
+#   ./download_contest.sh 1426 --problem A --problem B
+#   ./download_contest.sh 1426 --hours 3
+#   ./download_contest.sh 1426 --dry-run
 #
 # Структура:
 #   tasks/
