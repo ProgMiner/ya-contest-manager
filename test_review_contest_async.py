@@ -35,6 +35,8 @@ from review_contest import (
     call_model,
     review_all,
     review_unit,
+    INTER_CHUNK_TIMEOUT,
+    FIRST_CHUNK_TIMEOUT,
 )
 
 
@@ -103,10 +105,54 @@ class FakeSession:
 
 
 def good_response(content, status=200):
-    body = json.dumps(
-        {"choices": [{"message": {"content": content}}]}
-    ).encode("utf-8")
-    return FakeResponse(status, body)
+    return sse_response(content, status)
+
+
+HANG = object()  # sentinel: readline never returns
+
+
+class FakeStreamReader:
+    """Отдаёт заранее заданные строки; b"" = EOF.
+    Элемент HANG => зависание (для теста таймаута)."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    async def readline(self):
+        if not self._lines:
+            return b""
+        item = self._lines.pop(0)
+        if item is HANG:
+            await asyncio.Event().wait()
+        return item
+
+
+class FakeStreamResponse(FakeResponse):
+    """FakeResponse с .content для SSE-потока."""
+
+    def __init__(self, status=200, lines=(), headers=None):
+        super().__init__(status, b"", headers)
+        self.content = FakeStreamReader(lines)
+
+
+def sse_lines(*pieces, done=True):
+    """Собрать SSE-линии из кусков content-дельт."""
+    out = []
+    for p in pieces:
+        out.append(
+            b"data: "
+            + json.dumps({"choices": [{"delta": {"content": p}}]}).encode()
+            + b"\n"
+        )
+        out.append(b"\n")
+    if done:
+        out.append(b"data: [DONE]\n")
+    return out
+
+
+def sse_response(content, status=200, **kw):
+    """Заменяет good_response для потоковых тестов."""
+    return FakeStreamResponse(status, sse_lines(content), **kw)
 
 
 def make_unit(tmp: Path, alias="X", sid=123, solution="print(1)", statement="stmt"):
@@ -289,18 +335,21 @@ class TestCallModel(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TimeoutError):
             await call_model(**kwargs)
 
-    async def test_bad_json_response(self):
-        self.session._responses = [FakeResponse(200, b"not-json")]
-        with self.assertRaises(ModelCallError):
-            await call_model(**self.kwargs)
-
-    async def test_empty_choices_error_object(self):
-        self.session._responses = [
-            make_json_response({"error": "model overloaded"})
-        ]
+    async def test_non_sse_body_raises(self):
+        """Non-SSE 200 body results in empty content -> ModelCallError."""
+        lines = [b"not-json\n"]
+        self.session._responses = [FakeStreamResponse(200, lines)]
         with self.assertRaises(ModelCallError) as ctx:
             await call_model(**self.kwargs)
-        self.assertIn("model overloaded", str(ctx.exception))
+        self.assertIn("Ответ модели пуст", str(ctx.exception))
+
+    async def test_stream_inband_error_raises(self):
+        """data: {"error":"model overloaded"} -> ModelCallError."""
+        lines = [b'data: {"error":"model overloaded"}\n', b'\n']
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with self.assertRaises(ModelCallError) as ctx:
+            await call_model(**self.kwargs)
+        self.assertIn("overloaded", str(ctx.exception))
 
     async def test_base_url_trailing_slash(self):
         # record the url passed to session.post
@@ -321,28 +370,29 @@ class TestCallModel(unittest.IsolatedAsyncioTestCase):
 
     async def test_semaphore_bounds_concurrency(self):
         """With a semaphore of 1, only one request is in flight at a time."""
-        in_flight = 0
-        max_in_flight = 0
+        in_flight = [0]
+        max_in_flight = [0]
         entered = asyncio.Event()
         release = asyncio.Event()
 
-        class BlockingResponse(FakeResponse):
+        class BlockingStreamResponse(FakeStreamResponse):
+            def __init__(self):
+                super().__init__(status=200, lines=sse_lines("x"))
+
             async def __aenter__(self):
-                nonlocal in_flight, max_in_flight
-                in_flight += 1
-                max_in_flight = max(max_in_flight, in_flight)
+                in_flight[0] += 1
+                max_in_flight[0] = max(max_in_flight[0], in_flight[0])
                 entered.set()
                 await release.wait()
                 return self
 
             async def __aexit__(self, *exc):
-                nonlocal in_flight
-                in_flight -= 1
+                in_flight[0] -= 1
                 return False
 
         class BlockingSession(FakeSession):
             def post(self, *args, **kwargs):
-                return BlockingResponse(status=200, body=good_response("x")._body)
+                return BlockingStreamResponse()
 
         sess = BlockingSession([])
         sem = asyncio.Semaphore(1)
@@ -358,10 +408,284 @@ class TestCallModel(unittest.IsolatedAsyncioTestCase):
         ]
         await asyncio.wait_for(entered.wait(), timeout=5)
         await asyncio.sleep(0.05)
-        self.assertEqual(max_in_flight, 1)  # second task blocked by semaphore
+        self.assertEqual(max_in_flight[0], 1)  # second task blocked by semaphore
         release.set()
         await asyncio.gather(*tasks)
-        self.assertEqual(max_in_flight, 1)
+        self.assertEqual(max_in_flight[0], 1)
+
+    async def test_stream_accumulates_deltas(self):
+        """Content split across multiple SSE frames is concatenated."""
+        lines = sse_lines('{"per', 'cent": 80, "su', 'mmary": "Good", "remarks": []}', done=True)
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, '{"percent": 80, "summary": "Good", "remarks": []}')
+
+    async def test_stream_payload_has_stream_true(self):
+        """Request body must contain stream: True and Accept: text/event-stream."""
+        posted = []
+
+        class CaptureSession(FakeSession):
+            def post(self, url, *args, **kwargs):
+                posted.append(kwargs)
+                return FakePost(self._responses.pop(0))
+
+        sess = CaptureSession([sse_response("ok")])
+        kwargs = dict(self.kwargs, session=sess)
+        await call_model(**kwargs)
+        body = json.loads(posted[0]["data"])
+        self.assertTrue(body.get("stream"))
+        self.assertEqual(posted[0]["headers"]["Accept"], "text/event-stream")
+
+    async def test_stream_options_cannot_disable_stream(self):
+        """Even if MODEL_OPTIONS has stream: False, payload must have stream: True."""
+        posted = []
+
+        class CaptureSession(FakeSession):
+            def post(self, url, *args, **kwargs):
+                posted.append(kwargs)
+                return FakePost(self._responses.pop(0))
+
+        sess = CaptureSession([sse_response("ok")])
+        kwargs = dict(self.kwargs, session=sess)
+        with patch.object(rc, "MODEL_OPTIONS", {"stream": False, "temperature": 0}):
+            await call_model(**kwargs)
+        body = json.loads(posted[0]["data"])
+        self.assertTrue(body.get("stream"))
+
+    async def test_stream_done_marker_stops_read(self):
+        """data: [DONE] stops reading; extra lines after it are not consumed."""
+        extra_line = b'data: {"choices":[{"delta":{"content":"EXTRA"}}]}\n'
+        lines = sse_lines("hello", done=True) + [extra_line, b"\n"]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, "hello")
+
+    async def test_stream_eof_without_done(self):
+        """EOF without [DONE] terminates reading (regression guard for hot loop)."""
+        lines = sse_lines("partial", done=False)  # no [DONE]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, "partial")
+
+    async def test_stream_ignores_keepalive_and_comments(self):
+        """SSE comments and empty lines are skipped; content intact."""
+        lines = [
+            b": keepalive\n",
+            b"\n",
+            b"event: chunk\n",
+            b"\n",
+        ] + sse_lines("payload", done=True)
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, "payload")
+
+    async def test_stream_ignores_null_content_and_reasoning(self):
+        """delta.content=null is skipped, but delta.reasoning_content IS
+        accumulated into streams (all string keys are collected).
+        reasoning_content still counts as liveness (got_line)."""
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}\n',
+            b'\n',
+            b'data: {"choices":[{"delta":{"content":null}}]}\n',
+            b'\n',
+        ] + sse_lines("real content", done=True)
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        # reasoning_content not included in text output
+        self.assertEqual(text, "real content")
+
+    async def test_stream_inband_error_raises(self):
+        """data: {"error":"overloaded"} -> ModelCallError."""
+        lines = [b'data: {"error":"overloaded"}\n', b'\n']
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with self.assertRaises(ModelCallError) as ctx:
+            await call_model(**self.kwargs)
+        self.assertIn("overloaded", str(ctx.exception))
+
+    async def test_stream_skips_corrupt_frame(self):
+        """A corrupt data: line between good frames doesn't break the stream."""
+        lines = sse_lines("before", done=False)
+        lines += [
+            b"data: {corrupt json\n",
+            b"\n",
+        ]
+        lines += sse_lines("after", done=True)
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, "beforeafter")
+
+    async def test_stream_multiple_choices_accumulated(self):
+        """When choices contains multiple elements, content from all is accumulated."""
+        lines = [
+            b'data: {"choices":['
+            b'{"delta":{"content":"A"}},'
+            b'{"delta":{"content":"B"}}'
+            b']}\n',
+            b'\n',
+        ] + sse_lines("C", done=True)
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, "ABC")
+
+    async def test_stream_empty_content_raises(self):
+        """Complete stream with zero content deltas -> ModelCallError."""
+        lines = [
+            b'data: {"choices":[{"delta":{"content":null}}]}\n',
+            b'\n',
+            b"data: [DONE]\n",
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with self.assertRaises(ModelCallError) as ctx:
+            await call_model(**self.kwargs)
+        self.assertIn("Ответ модели пуст", str(ctx.exception))
+        # No non-empty streams received -> no details suffix
+        self.assertNotIn("получены потоки", str(ctx.exception))
+
+    async def test_stream_empty_content_with_other_streams_details(self):
+        """Stream with no 'content' but other stream keys -> empty error raised."""
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}\n',
+            b'\n',
+            b"data: [DONE]\n",
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with self.assertRaises(ModelCallError) as ctx:
+            await call_model(**self.kwargs)
+        self.assertIn("Ответ модели пуст", str(ctx.exception))
+
+    async def test_stream_multi_key_delta(self):
+        """A delta with content and reasoning_content accumulates both keys."""
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"A",'
+            b'"reasoning_content":"think"}}]}\n',
+            b'\n',
+            b'data: {"choices":[{"delta":{"content":"B",'
+            b'"reasoning_content":"-ing"}}]}\n',
+            b'\n',
+            b"data: [DONE]\n",
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, "AB")
+
+    async def test_stream_only_non_content_key(self):
+        """Delta with only a non-content key -> content empty, error raised."""
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n',
+            b'\n',
+            b"data: [DONE]\n",
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with self.assertRaises(ModelCallError) as ctx:
+            await call_model(**self.kwargs)
+        self.assertIn("Ответ модели пуст", str(ctx.exception))
+
+    async def test_stream_message_instead_of_delta(self):
+        """Providers may use 'message' instead of 'delta'; content accumulates."""
+        lines = [
+            b'data: {"choices":[{"message":{"content":"hello"}}]}\n',
+            b'\n',
+            b"data: [DONE]\n",
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        text = await call_model(**self.kwargs)
+        self.assertEqual(text, "hello")
+
+    async def test_inter_chunk_timeout_raises(self):
+        """If no chunk arrives within inter_chunk_timeout, TimeoutError is raised."""
+        lines = sse_lines("first", done=False) + [HANG]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        kwargs = dict(self.kwargs, timeout=0.1)
+        with patch.object(rc, "FIRST_CHUNK_TIMEOUT", 0.1):
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(call_model(**kwargs), timeout=2.0)
+
+    async def test_first_chunk_budget_longer_than_inter(self):
+        """First-chunk timeout is longer than inter-chunk timeout."""
+        lines = [HANG]  # never sends first chunk
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        kwargs = dict(self.kwargs, timeout=0.1)
+        with patch.object(rc, "FIRST_CHUNK_TIMEOUT", 0.5):
+            start = asyncio.get_event_loop().time()
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(call_model(**kwargs), timeout=5.0)
+            elapsed = asyncio.get_event_loop().time() - start
+            # Should fail near FIRST_CHUNK_TIMEOUT (0.5s), not inter_chunk (0.1s)
+            self.assertGreater(elapsed, 0.3)
+
+    async def test_first_chunk_budget_survives_keepalive(self):
+        """SSE comment lines (no choices) should not shorten first-chunk budget."""
+        lines = [b": keepalive\n", b"\n", HANG]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        kwargs = dict(self.kwargs, timeout=0.1)
+        with patch.object(rc, "FIRST_CHUNK_TIMEOUT", 0.5):
+            start = asyncio.get_event_loop().time()
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(call_model(**kwargs), timeout=5.0)
+            elapsed = asyncio.get_event_loop().time() - start
+            # Should timeout near 0.5s (first_chunk), not 0.1s (inter_chunk)
+            # because keepalive/comments have no choices and don't flip got_line
+            self.assertGreater(elapsed, 0.3)
+
+    async def test_reasoning_delta_switches_to_inter_chunk_budget(self):
+        """A reasoning_content delta (model is thinking) confirms liveness
+        and switches from first_chunk to inter_chunk timeout."""
+        # reasoning delta arrives, then the stream hangs.
+        # With FIRST_CHUNK_TIMEOUT=0.5 and inter_chunk=0.1,
+        # the reasoning delta should switch the budget to 0.1s,
+        # so the timeout fires near 0.1s after the reasoning delta, not 0.5s.
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}\n',
+            b'\n',
+            HANG,
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        kwargs = dict(self.kwargs, timeout=0.1)
+        with patch.object(rc, "FIRST_CHUNK_TIMEOUT", 0.5):
+            start = asyncio.get_event_loop().time()
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(call_model(**kwargs), timeout=5.0)
+            elapsed = asyncio.get_event_loop().time() - start
+            # Reasoning delta confirmed liveness -> budget switched to inter_chunk (0.1s).
+            # Total time ≈ time_to_reasoning_delta + 0.1s, well under 0.5s.
+            self.assertLess(elapsed, 0.45)
+
+    async def test_max_stream_chars_guard(self):
+        """Stream exceeding MAX_STREAM_CHARS -> ModelCallError."""
+        huge = "x" * 500
+        lines = sse_lines(huge, done=False) * 5  # 5 * 500 = 2500
+        lines.append(b"data: [DONE]\n")
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with patch.object(rc, "MAX_STREAM_CHARS", 1000):
+            with self.assertRaises(ModelCallError) as ctx:
+                await call_model(**self.kwargs)
+        self.assertIn("превысил", str(ctx.exception))
+
+    async def test_cancel_between_chunks_returns_empty(self):
+        """When cancel is set during streaming, call_model returns empty string."""
+        cancel = asyncio.Event()
+        lines = list(sse_lines("first", done=False))
+        resp = FakeStreamResponse(200, lines)
+        original_readline = resp.content.readline
+
+        async def delayed_readline():
+            # Позволяем cancel.set() cработать, пока читается первый чанк:
+            # проверка cancel в _read_sse_content происходит на верхушке цикла,
+            # поэтому cancel должен быть установлен к моменту завершения чтения.
+            await asyncio.sleep(0.15)
+            return await original_readline()
+
+        resp.content.readline = delayed_readline
+        self.session._responses = [resp]
+        kwargs = dict(self.kwargs, cancel=cancel)
+
+        async def set_cancel():
+            await asyncio.sleep(0.05)
+            cancel.set()
+
+        asyncio.create_task(set_cancel())
+        text = await asyncio.wait_for(call_model(**kwargs), timeout=5.0)
+        self.assertEqual(text, "")
 
 
 # ----------------------------------------------------------------------
@@ -380,7 +704,8 @@ class TestReviewUnit(unittest.IsolatedAsyncioTestCase):
     async def test_verdict_parsed(self):
         payload = {"percent": 80, "summary": "Good", "remarks": ["a", "b"]}
         with patch.object(
-            rc, "call_model", new=AsyncMock(return_value=json.dumps(payload))
+            rc, "call_model",
+            new=AsyncMock(return_value=json.dumps(payload)),
         ):
             result = await review_unit(
                 self.unit, session=None, semaphore=self.sem,
@@ -427,6 +752,20 @@ class TestReviewUnit(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsInstance(result, Failure)
         self.assertIn("не удалось прочитать файлы решения", result.reason)
+
+    async def test_cancel_mid_stream_is_failure(self):
+        """When call_model returns empty due to cancel, review_unit returns Failure."""
+        unit = make_unit(self.base)
+        cancel = asyncio.Event()
+        cancel.set()
+        with patch.object(rc, "call_model", new=AsyncMock(return_value="")):
+            result = await review_unit(
+                unit, session=None, semaphore=self.sem,
+                api_key="k", base_url="u", model_id="m", system_prompt="s",
+                cancel=cancel,
+            )
+        self.assertIsInstance(result, Failure)
+        self.assertIn(rc.CANCEL_REASON, result.reason)
 
 
 # ----------------------------------------------------------------------
@@ -588,7 +927,8 @@ class TestCancelEvent(unittest.IsolatedAsyncioTestCase):
         unit = make_unit(self.base, alias="X", sid=1)
         payload = {"percent": 80, "summary": "Good", "remarks": []}
         with patch.object(
-            rc, "call_model", new=AsyncMock(return_value=json.dumps(payload))
+            rc, "call_model",
+            new=AsyncMock(return_value=json.dumps(payload)),
         ):
             result = await review_unit(
                 unit, session=None, semaphore=asyncio.Semaphore(1),

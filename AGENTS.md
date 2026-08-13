@@ -15,8 +15,8 @@ Instructions for developers and AI agents modifying this codebase.
 | File | Purpose | Entry point |
 |---|---|---|
 | `api.py` | Shared module: `YandexContestAPI`, retry, pagination, helpers | — (imported) |
-| `make_ignored.py` | Bulk-ignore old Crash submissions | `async def main()` |
-| `crash_viewer.py` | View / download Crash submissions | `async def main()` |
+| `make_ignored.py` | Bulk-ignore old Crash submissions | `def main()` |
+| `crash_viewer.py` | View / download Crash submissions | `def main()` |
 | `download_contest.sh` | Wrapper over `crash_viewer.py` | direct execution |
 | `review_contest.py` | LLM-based contest review | `async def main()` |
 | `review_prompt.md` | System prompt for the model | — (read by `review_contest.py`) |
@@ -67,49 +67,35 @@ CSRF token extracted from `<meta name="secretkey">` or cookie, header: `x-csrf-t
 
 ### `api.py` — shared module for Yandex Contest API
 
-Contains `YandexContestAPI` (auth, request with retry, pagination), constants (`BASE_URL`, `TOKEN`, `CONCURRENCY`, `CRASH_VERDICT`), helpers for extracting fields from JSON submission objects, `parse_iso_time`, `sort_key`. `BASE_URL` is a hardcoded constant — not configurable via env vars or CLI flags.
+Contains `YandexContestAPI` (auth, request with retry, pagination), constants (`BASE_URL`, `TOKEN`, `CONCURRENCY`, `CRASH_VERDICT`), helpers for extracting fields from JSON submission objects, `parse_iso_time`, `sort_key`.
 
-**Quirk — trailing slash required:** `base_url` must end with `/` — aiohttp silently drops the path prefix otherwise (see `api.py:49-53`). The `base_url.rstrip("/") + "/"` normalization is intentional; do not remove it.
+See Quirk 1 in Design Decisions for the trailing-slash / leading-slash invariant.
 
 ### `make_ignored.py` — bulk ignore Crash
 
-Imports from `api.py`. For each (user, problem) pair, marks all Crash submissions as Ignored **except** the latest by `submissionTime`. Generates JavaScript for the admin console.
-
 ### `crash_viewer.py` — view / download Crash
 
-Imports from `api.py`. Inverse filter of `make_ignored.py`: for each (user, problem), keeps **only** the latest Crash submission. Users with any submission in the last N hours are excluded (still active).
+Complements make_ignored.py: this script keeps only the latest Crash submission per (user, problem); the other marks all-but-latest as Ignored.
 
 **`--problem` semantics:** numeric ID → matches by `problemId`; alphabetic alias → matches by `problemAlias`. You can mix them.
 
 ### `download_contest.sh` — wrapper
 
-Shell script: dry-run → parse lines `Задача <alias> (problemId=…)` via regex → `mkdir -p` → `cd solutions/ && crash_viewer.py --save --problem`.
+Shell script: dry-run → parse lines `Задача <alias> (problemId=…)` via regex → `mkdir -p` → `touch statement.md` (if missing) → `cd solutions/ && crash_viewer.py --save --problem`.
 
-**Quirk — stdout format contract:** `crash_viewer.py`'s dry-run output format (`Задача <alias> (problemId=…): N посылок`) is parsed by regex in this shell script. If you change the header format in `crash_viewer.py`, you **will** break the shell parser. Any header change requires updating the regex in `download_contest.sh`.
+See Quirk 2 in Design Decisions for the stdout format contract.
 
 Env var: `TASKS_DIR` (default `./tasks`) — used by the shell script only, **not** by `review_contest.py` (which uses `--tasks-dir` flag).
 
 ### `review_contest.py` — review orchestrator
 
-Does **not** make requests to the Yandex Contest API. Works with local files and sends requests to an OpenAI-compatible API.
+**Threshold logic:** `CONF_THRESHOLD = 15.0`. `percent ≤ CONF_THRESHOLD` → WA recommendation; `percent ≥ (100 - CONF_THRESHOLD)` → OK recommendation; in between → "N/A" (manual review). All three require operator confirmation in `interactive_review`. The relationship `100 - CONF_THRESHOLD` is the design intent and is not obvious from either literal alone — if you change the constant, re-derive the boundary.
 
-**Data flow:** `discover_units()` → `review_all()` (concurrent via `asyncio.gather`) → `interactive_review()` → `emit_admin_js_split()` + `emit_manual_urls()` → `cleanup(ok+wa+manual)`.
+**Ctrl+C:** See Quirk 6 for two-stage handling.
 
-**Model verdict:** JSON `{"percent": 0-100, "summary": "...", "remarks": [...]}`. Parsing via `parse_verdicts` with fallback strategies and `validate_payload` (type coercion).
+**Timeout/streaming:** Model requests are streamed (SSE, `stream: True`). `call_model` reads chunks via `_read_sse_content`. The `--timeout` value is the max pause **between** chunks; the budget to the **first** chunk is `FIRST_CHUNK_TIMEOUT` (longer, covers queue+prefill) and is not operator-configurable. The session `ClientTimeout(total=None)` disables the total cap — liveness is controlled by the inter-chunk timeout. Timeout log includes alias, attempt number, timeout value, endpoint, and model name.
 
-**Threshold logic:** `CONF_THRESHOLD = 15.0`. `percent ≤ CONF_THRESHOLD` → WA recommendation (requires operator confirmation); `percent ≥ (100 - CONF_THRESHOLD)` → auto-OK (no operator prompt); in between → "N/A" (manual review). The relationship `100 - CONF_THRESHOLD` is the design intent and is not obvious from either literal alone — if you change the constant, re-derive the boundary.
-
-**Key constants (values in code, names only here):** `REQUEST_TIMEOUT`, `MAX_ATTEMPTS`, `API_CONCURRENCY`, `API_MAX_RETRIES`, `API_RETRY_DELAY`, `RETRY_BACKOFF`, `RETRY_AFTER_CAP`, `CANCEL_REASON`.
-
-**MODEL_OPTIONS:** dict with model request parameters (temperature, reasoning_effort, prompt_cache_key) — values in code (`review_contest.py`, constant `MODEL_OPTIONS`).
-
-**Ctrl+C:** First → cancels in-flight requests via `task.cancel()` + `cancel.set()`, pending tasks → `Failure(CANCEL_REASON)`. Second → `os._exit(130)`. After `review_all`, the SIGINT handler is removed; standard `KeyboardInterrupt` is restored for `interactive_review`.
-
-**Timeout:** `TimeoutError` is **not** retried inside `call_model` — retry happens at the `review_unit` level, which owns the attempt budget. Timeout log includes alias, attempt number, timeout value, endpoint, and model name.
-
-**`emit_admin_js_split`:** `submission_id` is taken **only** from `unit` (filename), **never** from the model response. This is a security invariant — the model must not control which submission gets a verdict applied.
-
-**`discover_units` skip predicate:** a task is skipped if: `statement.md` is empty or missing; `solutions/` directory does not exist; filename is not numeric; dot-files (e.g. `.DS_Store`); subdirectories inside `solutions/`. This affects user-visible behavior — if you change the predicate, update Troubleshooting in README.
+**`emit_admin_js_split`:** See Quirk 4 for the submission_id security invariant.
 
 **File lifecycle after review:** all decided solutions (OK, WA, and manual-review) are **deleted**; only skipped files remain on disk. `--keep-files` disables deletion.
 
@@ -121,16 +107,14 @@ Two test suites; run **both** before submitting changes.
 
 | Suite | Command | What it covers |
 |---|---|---|
-| `test_review_contest_async.py` | `python3 -m unittest test_review_contest_async -v` | `_parse_retry_after`, `call_model` (429/5xx retry, backoff, Retry-After, timeout), `review_unit` (verdict parse, retry on garbage, Failure), `review_all` (gather, exception containment), coroutine signatures, concurrency clamp |
-| `test_e2e_review.py` | `python3 test_e2e_review.py` | Full CLI against mock server (port 18999): retry-on-429, concurrency, interactive review, JS generation, file cleanup. Creates artifacts in `.test_tmp/`, server script `.test_e2e_server.py`, log `.test_e2e_log.json` |
-
-E2E test requires port 18999 to be free.
+| `test_review_contest_async.py` | `python3 -m unittest test_review_contest_async -v` | `_parse_retry_after`, `call_model` (429/5xx retry, backoff, Retry-After, timeout, 4xx no-retry), `_read_sse_content` (stream EOF, keepalive vs `got_line`, reasoning delta budget switch, `MAX_STREAM_CHARS`, `stream: True` override), `review_unit` (verdict parse, retry on garbage, Failure), `review_all` (gather, exception containment, cancel propagation), `interactive_review` (+/-/Enter/q/EOF), coroutine signatures, concurrency clamp |
+| `test_e2e_review.py` | `python3 test_e2e_review.py` | Full CLI against mock server (port 18999): retry-on-429, concurrency, interactive review, JS generation, file cleanup |
 
 ---
 
 ## Design Decisions and Quirks
 
-1. **`base_url` trailing slash** — aiohttp silently drops the path prefix if `base_url` lacks a trailing `/`. The normalization in `api.py` (`base_url.rstrip("/") + "/"`) is load-bearing; do not remove.
+1. **`base_url` trailing slash + leading-slash strip** — aiohttp silently drops the path prefix if `base_url` lacks a trailing `/`. The normalization in `api.py` (`base_url.rstrip("/") + "/"`) is load-bearing; do not remove it. Symmetrically, `request()` strips the leading `/` from paths (`path.lstrip("/")`) because aiohttp's urljoin treats an absolute path as resetting the base prefix. Callers writing their own HTTP calls (like `crash_viewer.fetch_source`) must replicate this lstrip — or pass paths without the leading `/`.
 
 2. **`download_contest.sh` parses `crash_viewer.py` stdout** — the dry-run header format `Задача <alias> (problemId=…): N посылок` is a contract between the two scripts. Changing the header in `crash_viewer.py` breaks the shell regex. Always update both.
 
@@ -149,6 +133,18 @@ E2E test requires port 18999 to be free.
 9. **`TASKS_DIR` env var vs `--tasks-dir` flag** — the env var is read only by `download_contest.sh` (shell); `review_contest.py` reads `--tasks-dir` flag (Python). They default to the same value but are configured differently.
 
 10. **File lifecycle: delete OK/WA/manual** — destructive by default. Manual-review solutions are deleted too (operator uses admin-panel URLs to view them). `--keep-files` is the escape hatch. This design prevents re-reviewing already-processed solutions.
+
+11. **SSE streaming, not a single JSON body** — `call_model` sends `stream: True` and parses `data:` frames. The `if not line: break` check in `_read_sse_content` is mandatory: EOF without `[DONE]` must terminate the loop, or the reader spins hot. Streaming is mandatory for call_model; `stream: True` is always forced regardless of `MODEL_OPTIONS` contents. The `got_line` flag that controls the timeout budget switch (`FIRST_CHUNK_TIMEOUT` → `INTER_CHUNK_TIMEOUT`) is set upon receiving **any** SSE data frame with a non-empty `choices` array — this includes reasoning-only deltas (`reasoning_content` without `content`), which is the core purpose of the streaming design: the model is alive when it thinks, even before producing visible output. SSE comment lines (`: keepalive`) and empty separator lines do **not** set `got_line` — they carry no `choices` and prove nothing about model liveness.
+
+    `_read_sse_content` returns `str` — the concatenated `"content"` key, or `""` if no content values arrived at all. Internally it accumulates all string-valued keys of each delta/message into `streams: dict[str, str]` (incremental concatenation). `call_model` returns only the content string; reasoning streams are printed to stdout incrementally as they arrive, not preserved for the caller — **but only when `--debug` is passed**; without it, the entire reasoning-print machinery is inert. Non-content streams (e.g. `reasoning_content`) are printed in blocks: when the accumulated value exceeds `REASONING_THRESHOLD`, a preview (truncated at the last whitespace before the threshold) is printed and the remainder is kept; at stream end, any remaining tail is printed. `MAX_STREAM_CHARS` guards only the `"content"` key. The `"ответ..."` progress message prints only on the first `"content"` piece.
+
+12. **Exception-handler order in `call_model`**: `except TimeoutError: raise` must come **before** `except aiohttp.ClientError`. Load-bearing because `SocketTimeoutError` inherits from both.
+
+13. **`FIRST_CHUNK_TIMEOUT` vs `INTER_CHUNK_TIMEOUT`** — the first-chunk timeout is deliberately longer than the inter-chunk timeout (covers queue+prefill). The switch is triggered by `got_line` (see Quirk 11 for semantics).
+
+14. **`download_contest.sh` creates empty `statement.md` → `discover_units` skips it** — the shell script `touch`es `statement.md` if missing, producing an empty file. `review_contest.py`'s `discover_units` skips tasks where `statement.md` is empty, so freshly-seeded tasks are **always skipped** until the user fills in the statement. This is intentional but the cross-module interaction is non-obvious.
+
+15. **`crash_viewer.fetch_source` has its own retry logic** — independent from `api.py`'s retry. Changing retry parameters in `api.py` will **not** affect `crash_viewer`'s download path. Callers writing new source-fetching code must implement their own retry.
 
 ---
 

@@ -50,8 +50,26 @@ async def handle(request):
         json.dump(request_log, f)
     if len(request_log) == 1:      # first ever request: 429 -> retry
         return web.Response(status=429, text="rate limited")
+    # Streaming SSE response
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    })
+    await resp.prepare(request)
     content = json.dumps({"percent": 85, "summary": "Good", "remarks": ["x"]})
-    return web.json_response({"choices": [{"message": {"content": content}}]})
+    # Split content across multiple chunks to prove accumulation works
+    chunk_size = 7
+    for i in range(0, len(content), chunk_size):
+        piece = content[i:i + chunk_size]
+        await resp.write(
+            b"data: "
+            + json.dumps({"choices": [{"delta": {"content": piece}}]}).encode()
+            + b"\\n\\n"
+        )
+    await resp.write(b": keepalive\\n\\n")
+    await resp.write(b"data: [DONE]\\n\\n")
+    await resp.write_eof()
+    return resp
 
 async def main():
     app = web.Application()

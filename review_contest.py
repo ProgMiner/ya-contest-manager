@@ -41,6 +41,10 @@ from typing import Iterator
 
 import aiohttp
 
+# LineTooLong не реэкспортируется из aiohttp/__init__.py, но путь стабилен:
+# readline() поднимает её, если строка SSE длиннее 2*read_bufsize (512 КиБ).
+from aiohttp.http_exceptions import LineTooLong
+
 
 # ----------------------------------------------------------------------
 # Константы
@@ -49,7 +53,12 @@ import aiohttp
 TASKS_DIR_DEFAULT = "./tasks"
 PROMPT_FILE_DEFAULT = "review_prompt.md"
 MAX_ATTEMPTS = 3
-REQUEST_TIMEOUT = 1200
+INTER_CHUNK_TIMEOUT = 10     # макс. пауза между чанками SSE, с
+FIRST_CHUNK_TIMEOUT = 120    # бюджет до первого чанка (очередь + prefill), с
+CONNECT_TIMEOUT = 30         # TCP-connect / получение соединения из пула, с
+MAX_STREAM_CHARS = 2_000_000 # предел накопленного контента (защита от runaway-стрима)
+SSE_DATA_PREFIX = b"data:"
+SSE_DONE = b"[DONE]"
 REVIEW_API_KEY_ENV = "REVIEW_API_KEY"
 DEFAULT_BASE_URL = "https://polza.ai/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
@@ -67,6 +76,8 @@ MODEL_OPTIONS = {
     # "max_completion_tokens": 1000,
     # "max_output_tokens": 1000,
 }
+
+REASONING_THRESHOLD = 1000
 
 # Границы percent при валидации
 PERCENT_MIN = 0.0
@@ -220,6 +231,140 @@ def _parse_retry_after(value: str | None) -> float | None:
     return seconds if 0.0 <= seconds <= RETRY_AFTER_CAP else None
 
 
+async def _read_sse_content(
+    response: aiohttp.ClientResponse,
+    inter_chunk_timeout: float,
+    first_chunk_timeout: float,
+    cancel: asyncio.Event | None,
+    label: str = "",
+    reasoning_debug: bool = False,
+) -> str:
+    """Собрать SSE-поток. Возвращает контент (str) или None, если
+    ни одного строкового значения не пришло.
+
+    Накапливает все строковые ключи delta/message в streams: dict[str, str].
+    Ключ "content" — основной, возвращается как результат. Non-content
+    потоки (напр. reasoning_content) поблочно выводятся при превышении
+    REASONING_THRESHOLD: preview-часть печатается, остаток хранится
+    до следующего порога; в конце выводится непревышавший хвост.
+
+    Пауза между чанками > inter_chunk_timeout -> TimeoutError
+    (ретраем владеет review_unit). Если cancel установлен, чтение
+    прекращается (break); вызывающий (call_model) проверяет cancel
+    отдельно и возвращает "".
+    """
+    streams: dict[str, str] = {}
+    content_chars = 0
+    got_line = False
+
+    while True:
+        # Мягкая отмена: между чанками, без CancelledError
+        if cancel is not None and cancel.is_set():
+            break
+
+        budget = inter_chunk_timeout if got_line else first_chunk_timeout
+        try:
+            line = await asyncio.wait_for(
+                response.content.readline(), timeout=budget
+            )
+        except LineTooLong as exc:
+            raise ModelCallError(f"строка SSE длиннее лимита: {exc}") from exc
+
+        if not line:            # EOF: b"" — поток закончился без [DONE]
+            break
+
+        stripped = line.strip()
+        if not stripped:                                  # разделитель "\n"
+            continue
+        if not stripped.startswith(SSE_DATA_PREFIX):      # ": ping", "event:", "id:"
+            continue
+
+        payload = stripped[len(SSE_DATA_PREFIX):].strip()
+        if payload == SSE_DONE:
+            break
+
+        try:
+            chunk = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue                                      # битый чанк не фатален
+        if not isinstance(chunk, dict):
+            continue
+
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            error = chunk.get("error")
+            if error:
+                raise ModelCallError(f"Ошибка API в потоке: {error}")
+            continue                                      # напр. чанк только с usage
+
+        # Модель жива: любой чанк с choices подтверждает активность,
+        # включая reasoning_content (DeepSeek thinking mode) — модель
+        # размышляет, но ещё не выдаёт видимый ответ.
+        got_line = True
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = choice.get("message")             # часть провайдеров дублирует
+                if not isinstance(delta, dict):
+                    continue
+
+            # Копим все строковые ключи дельты (content, reasoning_content,
+            # и т.д.) — каждый поток отдельно, для диагностики. Пустые или
+            # нестроковые значения (None на finish_reason-чанке) пропускаем.
+            for key, value in delta.items():
+                if not isinstance(value, str) or not value:
+                    continue
+
+                if key == "content":
+                    if "content" not in streams:
+                        print(f"  {label}ответ...", flush=True)
+
+                    content_chars += len(value)
+                    if content_chars > MAX_STREAM_CHARS:
+                        raise ModelCallError(
+                            f"поток превысил {MAX_STREAM_CHARS} символов"
+                        )
+
+                    streams["content"] = streams.get("content", "") + value
+                    continue
+
+                # Учитываем только размышления модели для вывода пользователю
+                if not reasoning_debug or "reasoning" not in key.lower():
+                    continue
+
+                value = streams.get(key, "") + value
+
+                if key == "content" or len(value) < REASONING_THRESHOLD:
+                    streams[key] = value
+                    continue
+
+                value_preview = value[:REASONING_THRESHOLD]
+
+                i = (
+                    i for i in range(len(value_preview) - 1, -1, -1)
+                    if value_preview[i].isspace()
+                )
+                i = next(i, len(value_preview))
+
+                value_preview = value_preview[:i]
+                value = value[i + 1:].lstrip()
+
+                print(f"  {label}{key}: {value_preview}", flush=True)
+                streams[key] = value
+
+    # Выводим окончания размышления, которые не выводились ранее
+    for key, value in streams.items():
+        if key == "content":
+            continue
+
+        print(f"  {label}{key}: {value}", flush=True)
+
+    return streams.get("content", "")
+
+
 async def call_model(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
@@ -228,12 +373,19 @@ async def call_model(
     model_id: str,
     system_prompt: str,
     user_prompt: str,
-    timeout: int = REQUEST_TIMEOUT,
+    timeout: int = INTER_CHUNK_TIMEOUT,
     max_retries: int = API_MAX_RETRIES,
     retry_delay: float = API_RETRY_DELAY,
     label: str = "",
+    cancel: asyncio.Event | None = None,
+    reasoning_debug: bool = False,
 ) -> str:
-    """Запрос к модели: chat/completions. Возвращает текст ответа."""
+    """Запрос к модели: chat/completions (streaming).
+
+    Возвращает текст ответа (конкатенация ключа "content").
+    При пустом или отсутствующем контенте выбрасывает
+    ModelCallError("Ответ модели пуст").
+    """
 
     url = f"{base_url.rstrip('/')}/chat/completions"
     payload = {
@@ -243,16 +395,24 @@ async def call_model(
             {"role": "user", "content": user_prompt},
         ],
         **MODEL_OPTIONS,
+        "stream": True,
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "text/event-stream",
         "Authorization": f"Bearer {api_key}",
     }
     tag = f"{label}: " if label else ""
 
-    raw: bytes | None = None
+    request_timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=CONNECT_TIMEOUT,
+        sock_connect=CONNECT_TIMEOUT,
+        sock_read=max(float(timeout), float(FIRST_CHUNK_TIMEOUT)),
+    )
+
+    text: str | None = None
     last_error: ModelCallError | None = None
 
     for attempt in range(max_retries + 1):
@@ -264,7 +424,7 @@ async def call_model(
                     url,
                     data=body,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    timeout=request_timeout,
                 ) as response:
                     status = response.status
 
@@ -282,7 +442,14 @@ async def call_model(
                             f"HTTP {status} от {url}: {detail}"
                         )
                     else:
-                        raw = await response.read()
+                        text = await _read_sse_content(
+                            response,
+                            inter_chunk_timeout=float(timeout),
+                            first_chunk_timeout=float(FIRST_CHUNK_TIMEOUT),
+                            cancel=cancel,
+                            label=tag,
+                            reasoning_debug=reasoning_debug,
+                        )
 
         except TimeoutError:
             # Таймаут не ретраится здесь: повтор — ответственность review_unit,
@@ -294,7 +461,10 @@ async def call_model(
         except OSError as exc:
             raise ModelCallError(f"Ошибка сети: {exc}") from exc
 
-        if raw is not None:
+        if cancel is not None and cancel.is_set():
+            return ""
+
+        if text is not None:
             break
 
         if attempt < max_retries:
@@ -315,38 +485,15 @@ async def call_model(
             "исчерпаны попытки, но ошибка не сохранена"
         )
 
-    if raw is None:  # страховка
+    if text is None:  # страховка
         raise ModelCallError("Запрос к модели не выполнен")
 
-    # --- разбор ответа (без изменений) ---
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ModelCallError("Ответ модели не является JSON") from exc
+    text = text.strip()
 
-    if not isinstance(data, dict):
-        raise ModelCallError("Ответ модели не является JSON-объектом")
+    if not text:
+        raise ModelCallError(f"Ответ модели пуст")
 
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        error = data.get("error")
-        if error:
-            raise ModelCallError(f"Ошибка API: {error}")
-        raise ModelCallError("В ответе модели нет choices")
-
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    if not isinstance(message, dict):
-        raise ModelCallError("В ответе модели нет message")
-
-    content = message.get("content")
-    if content is None:
-        raise ModelCallError("В ответе модели нет content")
-    if not isinstance(content, str):
-        content = str(content)
-    if not content.strip():
-        raise ModelCallError("Ответ модели пуст")
-
-    return content
+    return text
 
 
 def read_text_file(path: Path) -> str:
@@ -367,10 +514,11 @@ async def review_unit(
     base_url: str,
     model_id: str,
     system_prompt: str,
-    timeout: int = REQUEST_TIMEOUT,
+    timeout: int = INTER_CHUNK_TIMEOUT,
     max_attempts: int = MAX_ATTEMPTS,
     retry_backoff: float = RETRY_BACKOFF,
     cancel: asyncio.Event | None = None,
+    reasoning_debug: bool = False,
 ) -> Verdict | Failure:
     """
     Прогнать одно решение через модель с повторами.
@@ -410,28 +558,14 @@ async def review_unit(
                 session, semaphore, api_key, base_url, model_id,
                 system_prompt, user_prompt, timeout,
                 label=label,
+                cancel=cancel,
+                reasoning_debug=reasoning_debug,
             )
         except TimeoutError:
             timed_out = True
         except (ModelCallError, OSError) as exc:
             print(f"  {label}: запрос к модели не выполнен: {exc}")
 
-        parsed = parse_verdicts(text)
-
-        if timed_out:
-            print(
-                f"  {label}: попытка {attempt}/{max_attempts}: превышен таймаут "
-                f"({timeout}с), endpoint {base_url}, модель {model_id}"
-            )
-
-        if parsed is not None:
-            print(
-                f"  {label}: попытка {attempt}: вердикт получен "
-                f"({parsed['percent']:g}%)"
-            )
-            return _make_verdict(unit, parsed, attempt)
-
-        # После неудачной попытки проверяем отмену перед паузой
         if cancel is not None and cancel.is_set():
             return Failure(
                 alias=unit.alias,
@@ -439,6 +573,22 @@ async def review_unit(
                 path=unit.solution_path,
                 reason=CANCEL_REASON,
             )
+
+        if timed_out:
+            print(
+                f"  {label}: попытка {attempt}/{max_attempts}: модель молчала "
+                f"дольше {timeout}с (нет чанков), endpoint {base_url}, "
+                f"модель {model_id}"
+            )
+
+        parsed = parse_verdicts(text)
+
+        if parsed is not None:
+            print(
+                f"  {label}: попытка {attempt}: вердикт получен "
+                f"({parsed['percent']:g}%)"
+            )
+            return _make_verdict(unit, parsed, attempt)
 
         if attempt < max_attempts:
             print(
@@ -467,10 +617,11 @@ async def review_all(
     base_url: str,
     model_id: str,
     system_prompt: str,
-    timeout: int = REQUEST_TIMEOUT,
+    timeout: int = INTER_CHUNK_TIMEOUT,
     max_attempts: int = MAX_ATTEMPTS,
     concurrency: int = API_CONCURRENCY,
     cancel: asyncio.Event | None = None,
+    reasoning_debug: bool = False,
 ) -> tuple[list[Verdict], list[Failure]]:
     """Прогнать все решения через модель конкурентно.
 
@@ -503,6 +654,7 @@ async def review_all(
             unit, session, semaphore, api_key, base_url, model_id,
             system_prompt, timeout=timeout, max_attempts=max_attempts,
             cancel=cancel,
+            reasoning_debug=reasoning_debug,
         )
         done += 1
         kind = "вердикт" if isinstance(result, Verdict) else "ОШИБКА"
@@ -517,7 +669,8 @@ async def review_all(
             "Accept": "application/json",
             "Content-Type": "application/json",
         },
-        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        # total=None: живость контролируется inter-chunk timeout в call_model
+        timeout=aiohttp.ClientTimeout(total=None),
     ) as session:
         # Создаём задачи явно, чтобы иметь возможность их отменить
         tasks = [asyncio.create_task(_review_one(u)) for u in units]
@@ -805,11 +958,6 @@ def interactive_review(
         unit = verdict.unit
         decision = decide_verdict(verdict.percent)
 
-        # не спрашиваем ручную проверку для уверенно-правильных решений
-        if decision == VERDICT_OK:
-            ok_list.append(verdict)
-            continue
-
         try:
             source = read_text_file(unit.solution_path)
         except OSError:
@@ -1085,10 +1233,11 @@ async def main() -> None:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=REQUEST_TIMEOUT,
+        default=INTER_CHUNK_TIMEOUT,
         help=(
-            "Таймаут одного запроса к модели, секунды "
-            f"(по умолчанию {REQUEST_TIMEOUT})"
+            "Максимальная пауза между чанками потокового ответа модели, "
+            "секунды; при превышении попытка считается провалившейся "
+            f"(по умолчанию {INTER_CHUNK_TIMEOUT})"
         ),
     )
 
@@ -1124,6 +1273,13 @@ async def main() -> None:
         action="store_true",
         default=False,
         help="Не удалять файлы решений после ревью",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Выводить поток размышлений модели (reasoning_content) на экран",
     )
 
     args = parser.parse_args()
@@ -1181,6 +1337,7 @@ async def main() -> None:
     print(f"Системный промпт: {args.prompt_file} ({len(system_prompt)} символов)")
     print(f"Найдено решений: {len(units)}")
     print(f"Конкурентность: {concurrency}")
+    print(f"Пауза между чанками: {args.timeout}с")
 
     if args.dry_run:
         print("\nЗапросы к модели (dry-run, выполнение пропущено):")
@@ -1234,6 +1391,7 @@ async def main() -> None:
             max_attempts=attempts,
             concurrency=concurrency,
             cancel=cancel,
+            reasoning_debug=args.debug,
         )
     finally:
         # Убираем обработчик — для interactive_review SIGINT
