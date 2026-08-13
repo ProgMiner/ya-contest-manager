@@ -32,6 +32,7 @@ from review_contest import (
     SolutionUnit,
     Verdict,
     _parse_retry_after,
+    _read_sse_content,
     call_model,
     review_all,
     review_unit,
@@ -538,8 +539,8 @@ class TestCallModel(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ModelCallError) as ctx:
             await call_model(**self.kwargs)
         self.assertIn("Ответ модели пуст", str(ctx.exception))
-        # No non-empty streams received -> no details suffix
-        self.assertNotIn("получены потоки", str(ctx.exception))
+        # No non-empty streams received -> streams attribute is an empty dict
+        self.assertEqual(ctx.exception.streams, {})
 
     async def test_stream_empty_content_with_other_streams_details(self):
         """Stream with no 'content' but other stream keys -> empty error raised."""
@@ -552,6 +553,10 @@ class TestCallModel(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ModelCallError) as ctx:
             await call_model(**self.kwargs)
         self.assertIn("Ответ модели пуст", str(ctx.exception))
+        # Reasoning streams are attached to the error
+        self.assertIsNotNone(ctx.exception.streams)
+        self.assertIn("reasoning_content", ctx.exception.streams)
+        self.assertEqual(ctx.exception.streams["reasoning_content"], "thinking...")
 
     async def test_stream_multi_key_delta(self):
         """A delta with content and reasoning_content accumulates both keys."""
@@ -579,6 +584,93 @@ class TestCallModel(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ModelCallError) as ctx:
             await call_model(**self.kwargs)
         self.assertIn("Ответ модели пуст", str(ctx.exception))
+        # The reasoning stream is attached to the error
+        self.assertIsNotNone(ctx.exception.streams)
+        self.assertIn("reasoning_content", ctx.exception.streams)
+
+    async def test_model_call_error_streams_attribute(self):
+        """ModelCallError carries the accumulated streams on empty content."""
+        # Empty content WITH reasoning streams -> streams dict populated
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n',
+            b'\n',
+            b"data: [DONE]\n",
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with self.assertRaises(ModelCallError) as ctx:
+            await call_model(**self.kwargs)
+        self.assertEqual(
+            ctx.exception.streams, {"reasoning_content": "think"}
+        )
+
+        # Empty content with NO non-content streams -> empty dict
+        lines2 = [
+            b'data: {"choices":[{"delta":{"content":null}}]}\n',
+            b'\n',
+            b"data: [DONE]\n",
+        ]
+        self.session._responses = [FakeStreamResponse(200, lines2)]
+        with self.assertRaises(ModelCallError) as ctx:
+            await call_model(**self.kwargs)
+        self.assertEqual(ctx.exception.streams, {})
+
+    async def test_reasoning_debug_false_does_not_print_reasoning(self):
+        """reasoning_debug=False: reasoning accumulated but never printed."""
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n',
+            b'\n',
+        ] + sse_lines("real content", done=True)
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with patch.object(rc, "print") as mock_print:
+            text = await call_model(**self.kwargs)
+        self.assertEqual(text, "real content")
+        # reasoning_content must never appear in print output
+        for call in mock_print.call_args_list:
+            args = call.args
+            if args and "reasoning_content" in str(args[0]):
+                self.fail(f"reasoning leaked into print: {args[0]!r}")
+
+    async def test_reasoning_debug_true_prints_reasoning(self):
+        """reasoning_debug=True: reasoning_content is printed."""
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n',
+            b'\n',
+        ] + sse_lines("real content", done=True)
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with patch.object(rc, "print") as mock_print:
+            await call_model(**self.kwargs, reasoning_debug=True)
+        printed = " ".join(
+            str(c.args[0]) for c in mock_print.call_args_list if c.args
+        )
+        self.assertIn("reasoning_content", printed)
+
+    async def test_read_sse_content_returns_tuple(self):
+        """_read_sse_content returns (content, streams)."""
+        # reasoning_debug=False: streams returned intact
+        lines = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n',
+            b'\n',
+        ] + sse_lines("hello", done=True)
+        content, streams = await _read_sse_content(
+            FakeStreamResponse(200, lines), 0.1, 0.1, None,
+        )
+        self.assertEqual(content, "hello")
+        self.assertIsInstance(streams, dict)
+        self.assertEqual(streams["reasoning_content"], "think")
+        self.assertEqual(streams["content"], "hello")
+
+        # reasoning_debug=True: streams is None (consumed by printing tails)
+        lines2 = [
+            b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n',
+            b'\n',
+        ] + sse_lines("hello", done=True)
+        with patch.object(rc, "print"):
+            content2, streams2 = await _read_sse_content(
+                FakeStreamResponse(200, lines2), 0.1, 0.1, None,
+                reasoning_debug=True,
+            )
+        self.assertEqual(content2, "hello")
+        self.assertIsNone(streams2)
 
     async def test_stream_message_instead_of_delta(self):
         """Providers may use 'message' instead of 'delta'; content accumulates."""
@@ -766,6 +858,50 @@ class TestReviewUnit(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIsInstance(result, Failure)
         self.assertIn(rc.CANCEL_REASON, result.reason)
+
+    async def test_call_model_error_prints_streams(self):
+        """On ModelCallError with streams, review_unit dumps them as logs."""
+        err = ModelCallError("Ответ модели пуст", streams={
+            "reasoning_content": "thinking...",
+        })
+        with patch.object(
+            rc, "call_model",
+            new=AsyncMock(side_effect=err),
+        ), patch.object(rc.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(rc, "print") as mock_print:
+            result = await review_unit(
+                self.unit, session=None, semaphore=self.sem,
+                api_key="k", base_url="u", model_id="m", system_prompt="s",
+                max_attempts=1,
+            )
+        self.assertIsInstance(result, Failure)
+        # The --- Лог --- / value / --- Конец лога --- block was printed.
+        # Note: the print format uses f"\n--- Лог {key} ---" (leading \n).
+        printed = "".join(
+            str(c.args[0]) for c in mock_print.call_args_list if c.args
+        )
+        self.assertIn("--- Лог reasoning_content ---", printed)
+        self.assertIn("thinking...", printed)
+        self.assertIn("--- Конец лога ---", printed)
+
+    async def test_call_model_error_no_streams_no_logs(self):
+        """On ModelCallError with streams=None, no --- Лог --- block is printed."""
+        err = ModelCallError("Ответ модели пуст")  # streams defaults to None
+        with patch.object(
+            rc, "call_model",
+            new=AsyncMock(side_effect=err),
+        ), patch.object(rc.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(rc, "print") as mock_print:
+            result = await review_unit(
+                self.unit, session=None, semaphore=self.sem,
+                api_key="k", base_url="u", model_id="m", system_prompt="s",
+                max_attempts=1,
+            )
+        self.assertIsInstance(result, Failure)
+        for call in mock_print.call_args_list:
+            args = call.args
+            if args and "Конец лога" in str(args[0]):
+                self.fail("--- Лог --- block printed despite streams=None")
 
 
 # ----------------------------------------------------------------------

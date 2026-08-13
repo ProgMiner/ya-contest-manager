@@ -134,6 +134,10 @@ class Failure:
 class ModelCallError(RuntimeError):
     """Запрос к модели не выполнен (HTTP-ошибка, сеть, битый ответ)."""
 
+    def __init__(self, message, streams=None):
+        super().__init__(message)
+        self.streams = streams
+
 
 # ----------------------------------------------------------------------
 # Обнаружение решений
@@ -238,15 +242,20 @@ async def _read_sse_content(
     cancel: asyncio.Event | None,
     label: str = "",
     reasoning_debug: bool = False,
-) -> str:
-    """Собрать SSE-поток. Возвращает контент (str) или None, если
-    ни одного строкового значения не пришло.
+) -> tuple[str, dict[str, str] | None]:
+    """Собрать SSE-поток. Возвращает кортеж (content, streams).
+
+    content — сконкатенированный ключ "content" (str, "" если нет).
+    streams — словарь накопленных потоков (dict[str, str]) или None
+    (если reasoning_debug=True и потоки уже выведены на экран).
 
     Накапливает все строковые ключи delta/message в streams: dict[str, str].
     Ключ "content" — основной, возвращается как результат. Non-content
-    потоки (напр. reasoning_content) поблочно выводятся при превышении
-    REASONING_THRESHOLD: preview-часть печатается, остаток хранится
-    до следующего порога; в конце выводится непревышавший хвост.
+    потоки с "reasoning" в имени ключа поблочно выводятся при
+    reasoning_debug=True и превышении REASONING_THRESHOLD:
+    preview-часть печатается, остаток хранится до следующего порога;
+    в конце выводится непревышавший хвост. При reasoning_debug=False
+    reasoning-потоки молча накапливаются в streams без печати.
 
     Пауза между чанками > inter_chunk_timeout -> TimeoutError
     (ретраем владеет review_unit). Если cancel установлен, чтение
@@ -265,10 +274,14 @@ async def _read_sse_content(
         budget = inter_chunk_timeout if got_line else first_chunk_timeout
         try:
             line = await asyncio.wait_for(
-                response.content.readline(), timeout=budget
+                response.content.readline(),
+                timeout=budget,
             )
         except LineTooLong as exc:
-            raise ModelCallError(f"строка SSE длиннее лимита: {exc}") from exc
+            raise ModelCallError(
+                f"строка SSE длиннее лимита: {exc}",
+                streams=streams,
+            ) from exc
 
         if not line:            # EOF: b"" — поток закончился без [DONE]
             break
@@ -294,7 +307,10 @@ async def _read_sse_content(
         if not isinstance(choices, list) or not choices:
             error = chunk.get("error")
             if error:
-                raise ModelCallError(f"Ошибка API в потоке: {error}")
+                raise ModelCallError(
+                    f"Ошибка API в потоке: {error}",
+                    streams=streams,
+                )
             continue                                      # напр. чанк только с usage
 
         # Модель жива: любой чанк с choices подтверждает активность,
@@ -325,19 +341,20 @@ async def _read_sse_content(
                     content_chars += len(value)
                     if content_chars > MAX_STREAM_CHARS:
                         raise ModelCallError(
-                            f"поток превысил {MAX_STREAM_CHARS} символов"
+                            f"поток превысил {MAX_STREAM_CHARS} символов",
+                            streams=streams,
                         )
 
                     streams["content"] = streams.get("content", "") + value
                     continue
 
                 # Учитываем только размышления модели для вывода пользователю
-                if not reasoning_debug or "reasoning" not in key.lower():
+                if "reasoning" not in key.lower():
                     continue
 
                 value = streams.get(key, "") + value
 
-                if key == "content" or len(value) < REASONING_THRESHOLD:
+                if not reasoning_debug or len(value) < REASONING_THRESHOLD:
                     streams[key] = value
                     continue
 
@@ -355,14 +372,19 @@ async def _read_sse_content(
                 print(f"  {label}{key}: {value_preview}", flush=True)
                 streams[key] = value
 
+    content = streams.get("content", "")
+
     # Выводим окончания размышления, которые не выводились ранее
-    for key, value in streams.items():
-        if key == "content":
-            continue
+    if reasoning_debug:
+        for key, value in streams.items():
+            if key == "content":
+                continue
 
-        print(f"  {label}{key}: {value}", flush=True)
+            print(f"  {label}{key}: {value}", flush=True)
 
-    return streams.get("content", "")
+        streams = None
+
+    return content, streams
 
 
 async def call_model(
@@ -413,6 +435,7 @@ async def call_model(
     )
 
     text: str | None = None
+    streams: dict | None = None
     last_error: ModelCallError | None = None
 
     for attempt in range(max_retries + 1):
@@ -442,7 +465,7 @@ async def call_model(
                             f"HTTP {status} от {url}: {detail}"
                         )
                     else:
-                        text = await _read_sse_content(
+                        text, streams = await _read_sse_content(
                             response,
                             inter_chunk_timeout=float(timeout),
                             first_chunk_timeout=float(FIRST_CHUNK_TIMEOUT),
@@ -486,12 +509,12 @@ async def call_model(
         )
 
     if text is None:  # страховка
-        raise ModelCallError("Запрос к модели не выполнен")
+        raise ModelCallError("Запрос к модели не выполнен", streams=streams)
 
     text = text.strip()
 
     if not text:
-        raise ModelCallError(f"Ответ модели пуст")
+        raise ModelCallError(f"Ответ модели пуст", streams=streams)
 
     return text
 
@@ -552,19 +575,26 @@ async def review_unit(
 
         text = ""
         timed_out = False
+        tag = f"{label}: попытка {attempt}/{max_attempts}"
 
         try:
             text = await call_model(
                 session, semaphore, api_key, base_url, model_id,
                 system_prompt, user_prompt, timeout,
-                label=label,
+                label=tag,
                 cancel=cancel,
                 reasoning_debug=reasoning_debug,
             )
         except TimeoutError:
             timed_out = True
         except (ModelCallError, OSError) as exc:
-            print(f"  {label}: запрос к модели не выполнен: {exc}")
+            print(f"  {tag}: запрос к модели не выполнен: {exc}")
+
+            if isinstance(exc, ModelCallError) and exc.streams is not None:
+                for key, value in exc.streams.items():
+                    print(f"\n--- Лог {key} ---")
+                    print(value)
+                    print(f"--- Конец лога ---")
 
         if cancel is not None and cancel.is_set():
             return Failure(
@@ -576,7 +606,7 @@ async def review_unit(
 
         if timed_out:
             print(
-                f"  {label}: попытка {attempt}/{max_attempts}: модель молчала "
+                f"  {tag}: модель молчала "
                 f"дольше {timeout}с (нет чанков), endpoint {base_url}, "
                 f"модель {model_id}"
             )
@@ -585,19 +615,19 @@ async def review_unit(
 
         if parsed is not None:
             print(
-                f"  {label}: попытка {attempt}: вердикт получен "
+                f"  {tag}: вердикт получен "
                 f"({parsed['percent']:g}%)"
             )
             return _make_verdict(unit, parsed, attempt)
 
         if attempt < max_attempts:
             print(
-                f"  {label}: попытка {attempt}: не удалось разобрать ответ, "
+                f"  {tag}: не удалось разобрать ответ, "
                 f"повтор..."
             )
             await asyncio.sleep(retry_backoff * attempt)
         else:
-            print(f"  {label}: попытка {attempt}: не удалось разобрать ответ.")
+            print(f"  {tag}: не удалось разобрать ответ.")
             preview = text[:RAW_PREVIEW_CHARS]
             if preview:
                 print(f"  Превью ответа: {preview}", file=sys.stderr)
