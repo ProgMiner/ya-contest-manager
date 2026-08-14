@@ -70,7 +70,7 @@ VERDICT_WA = "WrongAnswer"
 ADMIN_SUBMISSION_URL = "https://admin.contest.yandex.ru/submissions/{submission_id}"
 
 MODEL_OPTIONS = {
-    "temperature": 0,
+    "temperature": 0.3,
     "reasoning_effort": "low",
     "prompt_cache_key": "ya-review",
     # "max_completion_tokens": 1000,
