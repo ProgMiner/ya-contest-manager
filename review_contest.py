@@ -56,7 +56,8 @@ MAX_ATTEMPTS = 3
 INTER_CHUNK_TIMEOUT = 10     # макс. пауза между чанками SSE, с
 FIRST_CHUNK_TIMEOUT = 120    # бюджет до первого чанка (очередь + prefill), с
 CONNECT_TIMEOUT = 30         # TCP-connect / получение соединения из пула, с
-MAX_STREAM_CHARS = 2_000_000 # предел накопленного контента (защита от runaway-стрима)
+MAX_CONTENT_CHARS = 10_000   # предел накопленного content (защита от зацикливания)
+MAX_REASONING_CHARS = 50_000 # предел накопленного reasoning (защита от зацикливания)
 SSE_DATA_PREFIX = b"data:"
 SSE_DONE = b"[DONE]"
 REVIEW_API_KEY_ENV = "REVIEW_API_KEY"
@@ -262,7 +263,8 @@ async def _read_sse_content(
     прекращается (break); вызывающий (call_model) проверяет cancel
     отдельно и возвращает "".
     """
-    streams: dict[str, str] = {}
+    streams: dict[str, str] | None = {}
+    reasoning_chars = 0
     content_chars = 0
     got_line = False
 
@@ -338,27 +340,35 @@ async def _read_sse_content(
                     if "content" not in streams:
                         print(f"  {label}ответ...", flush=True)
 
+                # Учитываем только content и размышления модели
+                if key != "content" and "reasoning" not in key.lower():
+                    continue
+
+                new_value = streams.get(key, "") + value
+
+                if key == "content":
                     content_chars += len(value)
-                    if content_chars > MAX_STREAM_CHARS:
+                    if content_chars > MAX_CONTENT_CHARS:
                         raise ModelCallError(
-                            f"поток превысил {MAX_STREAM_CHARS} символов",
+                            f"content превысил {MAX_CONTENT_CHARS} символов",
                             streams=streams,
                         )
-
-                    streams["content"] = streams.get("content", "") + value
+                    streams["content"] = new_value
                     continue
 
-                # Учитываем только размышления модели для вывода пользователю
-                if "reasoning" not in key.lower():
+                # reasoning-ключи
+                reasoning_chars += len(value)
+                if reasoning_chars > MAX_REASONING_CHARS:
+                    raise ModelCallError(
+                        f"reasoning превысил {MAX_REASONING_CHARS} символов",
+                        streams=streams,
+                    )
+
+                if not reasoning_debug or len(new_value) < REASONING_THRESHOLD:
+                    streams[key] = new_value
                     continue
 
-                value = streams.get(key, "") + value
-
-                if not reasoning_debug or len(value) < REASONING_THRESHOLD:
-                    streams[key] = value
-                    continue
-
-                value_preview = value[:REASONING_THRESHOLD]
+                value_preview = new_value[:REASONING_THRESHOLD]
 
                 i = (
                     i for i in range(len(value_preview) - 1, -1, -1)
@@ -367,10 +377,10 @@ async def _read_sse_content(
                 i = next(i, len(value_preview))
 
                 value_preview = value_preview[:i]
-                value = value[i + 1:].lstrip()
+                remainder = new_value[i + 1:].lstrip()
 
                 print(f"  {label}{key}: {value_preview}", flush=True)
-                streams[key] = value
+                streams[key] = remainder
 
     content = streams.get("content", "")
 
@@ -1149,9 +1159,6 @@ def emit_manual_urls(manual: list[Verdict]) -> None:
                 submission_id=verdict.unit.submission_id,
             )
         )
-
-
-
 
 
 def cleanup(

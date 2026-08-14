@@ -743,15 +743,33 @@ class TestCallModel(unittest.IsolatedAsyncioTestCase):
             self.assertLess(elapsed, 0.45)
 
     async def test_max_stream_chars_guard(self):
-        """Stream exceeding MAX_STREAM_CHARS -> ModelCallError."""
+        """Stream exceeding MAX_CONTENT_CHARS -> ModelCallError."""
         huge = "x" * 500
         lines = sse_lines(huge, done=False) * 5  # 5 * 500 = 2500
         lines.append(b"data: [DONE]\n")
         self.session._responses = [FakeStreamResponse(200, lines)]
-        with patch.object(rc, "MAX_STREAM_CHARS", 1000):
+        with patch.object(rc, "MAX_CONTENT_CHARS", 1000):
             with self.assertRaises(ModelCallError) as ctx:
                 await call_model(**self.kwargs)
-        self.assertIn("превысил", str(ctx.exception))
+        self.assertIn("content превысил", str(ctx.exception))
+
+    async def test_max_reasoning_chars_guard(self):
+        """Reasoning exceeding MAX_REASONING_CHARS -> ModelCallError."""
+        huge = "x" * 500
+        lines = []
+        for _ in range(5):  # 5 * 500 = 2500
+            lines.append(
+                b'data: {"choices":[{"delta":{"reasoning_content":"'
+                + huge.encode()
+                + b'"}}]}\n'
+            )
+            lines.append(b"\n")
+        lines.append(b"data: [DONE]\n")
+        self.session._responses = [FakeStreamResponse(200, lines)]
+        with patch.object(rc, "MAX_REASONING_CHARS", 1000):
+            with self.assertRaises(ModelCallError) as ctx:
+                await call_model(**self.kwargs)
+        self.assertIn("reasoning превысил", str(ctx.exception))
 
     async def test_cancel_between_chunks_returns_empty(self):
         """When cancel is set during streaming, call_model returns empty string."""
