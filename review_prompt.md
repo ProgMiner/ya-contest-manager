@@ -28,6 +28,8 @@ Evaluate the attached solution (the problem statement and source code are provid
    - Does the output format match the problem statement?
    - Does it fit within time and memory constraints (asymptotic complexity)?
 
+   - **Distinguish substantial errors from minor typos.** Typos in syntax (keywords, operators, punctuation) and in variable/function names that are obviously transcription errors do not by themselves make the solution wrong. Judge the solution by its algorithm and the substantive correctness of its implementation, not by minor inaccuracies that a human reviewer would overlook.
+
    Follow these rules during the analysis:
    - Once a fact, condition, or hypothesis has been established, treat it as settled unless new evidence directly contradicts it. Do not re-verify, re-read, or re-argue the same point.
    - If several interpretations are plausible, consider each once, compare with the available evidence, choose the best-supported one, and move on. Do not oscillate between alternatives.
@@ -65,7 +67,7 @@ Fields:
 2. **Do not guess.** If the code is unclear, obfuscated, or too short to understand the algorithm — give a low percentage and state the reason.
 3. **Account for constraints.** If the algorithm is correct but the asymptotic complexity exceeds the limits — lower the percentage (the solution would get TL, not OK).
 4. **Output format matters.** In manually reviewed problems, the answer format is often non-standard. If the output does not match the statement — this is a serious problem.
-5. **Be strict on substance, lenient on trivia.** A missing semicolon or extra whitespace in the output is not a reason to drop the percentage to zero. But a wrong algorithm is 0–20%.
+5. **Be strict on substance, lenient on trivia.** Typos in syntax (keywords, operators, punctuation) and in variable/function names, a missing semicolon, or extra whitespace in the output are not reasons to drop the percentage — these are minor inaccuracies, not substantial errors. Judge the solution by its algorithm and the substantive correctness of its implementation. A wrong algorithm or a real logical bug is 0–20%.
 
 ## Report format
 
